@@ -1,0 +1,48 @@
+[package]
+name = "chiaki-controller"
+version = "0.1.0"
+edition = "2021"
+description = "Input-only PS5 Remote Play client for Windows: keyboard and mouse as a DualSense, no video or audio"
+license = "AGPL-3.0-only"
+
+[[bin]]
+name = "chiaki-controller"
+path = "src/main.rs"
+
+[dependencies]
+aes = "0.8.4"
+cfb-mode = "0.8.2"
+aes-gcm = "0.10.3"
+hmac = "0.12.1"
+sha2 = "0.10.8"
+k256 = { version = "0.13.4", features = ["ecdh"] }
+rand = "0.8.5"
+base64 = "0.22.1"
+serde = { version = "1.0.210", features = ["derive"] }
+toml = "0.8.19"
+anyhow = "1.0.89"
+clap = { version = "4.5.20", features = ["derive"] }
+log = "0.4.22"
+env_logger = "0.11.5"
+eframe = "0.29.1"
+raw-window-handle = "0.6.2"
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.19.1"
+windows-sys = { version = "0.59.0", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_Media",
+    "Win32_Networking_WinSock",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

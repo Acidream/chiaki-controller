@@ -1,0 +1,5 @@
+/target
+# your own config holds the console credentials (regist key, RP key, address)
+/chiaki-controller.toml
+*.toml.tmp
+*.log
