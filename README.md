@@ -41,7 +41,10 @@ and Windows.
    is no embedded login window). Only an address on Sony's exact redirect page is accepted. The
    one-time code it contains is exchanged once with Sony over verified HTTPS and is never logged
    or saved, and the clipboard is cleared after it is read. Only the account ID itself is kept.
-3. Build: `cargo build --release` (the binary is `target\release\chiaki-controller.exe`).
+3. Download `chiaki-controller.exe` from the
+   [latest release](https://github.com/Acidream/chiaki-controller/releases/latest) (no installer;
+   if SmartScreen warns about the unsigned exe, choose *More info › Run anyway*). Or build it
+   yourself: `cargo build --release` (the binary is `target\release\chiaki-controller.exe`).
 4. Start `chiaki-controller.exe` (no arguments). A setup guide opens the first time:
    1. **Find PS5**: consoles on your network are listed with their name and whether they are on
       or in rest mode (or type the address).
