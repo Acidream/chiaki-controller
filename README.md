@@ -1,58 +1,67 @@
 # chiaki-controller
 
-An input-only PS5 Remote Play client for Windows, written in Rust. It turns your keyboard and
-mouse into a DualSense (or DualShock 4) on your PS5, and does nothing else: no video decoding,
-no audio, no rendering. Use it when you're watching the PS5 on a TV or capture card and just want
-to play it with keyboard and mouse.
+Play your PS5 with keyboard and mouse from a Windows PC. chiaki-controller is an input-only PS5
+Remote Play client: your keyboard and mouse become a DualSense (or DualShock 4) on the console,
+and it does nothing else: no video, no audio. Use it when you watch the PS5 on a TV, monitor or
+capture card and just want to control it from the PC.
 
 It is made to work over Wi-Fi. Your input is a few small packets, the console is asked for the
 smallest video stream (which is thrown away unread), and nothing waits on video or audio, so a PC
 on Wi-Fi doesn't get the lag and stutter of a full Remote Play stream. Tested with GTA VI.
 
-It is a port of the protocol parts of [chiaki-ng](https://github.com/streetpea/chiaki-ng)
-(registration, session/ctrl, Takion transport, stream crypto, feedback packets), reduced to PS5
-and Windows.
+**[Download chiaki-controller.exe](https://github.com/Acidream/chiaki-controller/releases/latest)**
+(Windows 10 / 11, 64-bit, no installer)
 
-## Why it's low latency
+## Getting started
 
-- Every input change is sent the moment the Raw Input event arrives: the window hands it straight
-  to the input thread, which applies the bindings and sends at once (events that arrive together
-  go out as one update). Button changes go out as feedback-history packets, stick changes as
-  feedback-state packets.
-- Lost button releases are covered by resending the newest history packet 20/50/100/200 ms later
-  (same scheme as chiaki-ng), so nothing gets stuck.
-- Video and audio packets are dropped after reading one byte: no MAC check, no decryption, no
-  decode. The client asks for the smallest stream (360p, 30 fps, 2 Mbps) so the console and
-  network have little to send. (The console always streams video; it can't be turned off.)
-- Mouse to stick conversion runs at 500 Hz with a 1 ms system timer.
-
-## Setup
-
-1. On the PS5: Settings > System > Remote Play > enable Remote Play. For waking from rest mode,
-   also enable Settings > System > Power Saving > Features Available in Rest Mode > Stay Connected
-   to the Internet and Enable Turning On PS5 from Network.
-2. Your PSN account ID is looked up for you during setup (step 4): press **Sign in with
-   PlayStation…** (or run `chiaki-controller account-id`). Sony's sign-in page opens in your own
-   browser; sign in there, and when the page shows "redirect", copy the address bar. The app picks
-   the address up from the clipboard and asks Sony for the ID. If you already use chiaki-ng, its
-   base64 "PSN Account-ID" can be pasted instead.
-
-   How this stays safe: your password is only typed into Sony's site, never into this app (there
-   is no embedded login window). Only an address on Sony's exact redirect page is accepted. The
-   one-time code it contains is exchanged once with Sony over verified HTTPS and is never logged
-   or saved, and the clipboard is cleared after it is read. Only the account ID itself is kept.
-3. Download `chiaki-controller.exe` from the
-   [latest release](https://github.com/Acidream/chiaki-controller/releases/latest) (no installer;
-   if SmartScreen warns about the unsigned exe, choose *More info › Run anyway*). Or build it
-   yourself: `cargo build --release` (the binary is `target\release\chiaki-controller.exe`).
-4. Start `chiaki-controller.exe` (no arguments). A setup guide opens the first time:
+1. **Prepare the PS5**: Settings › System › Remote Play › turn on **Enable Remote Play**.
+   To let the app wake the PS5 from rest mode, also turn on Settings › System › Power Saving ›
+   Features Available in Rest Mode › **Stay Connected to the Internet** and **Enable Turning On
+   PS5 from Network**. The PC and the PS5 must be on the same network.
+2. **Download** `chiaki-controller.exe` from the
+   [latest release](https://github.com/Acidream/chiaki-controller/releases/latest) and start it.
+   The exe isn't signed, so Windows SmartScreen may warn about it: choose *More info › Run anyway*.
+3. **Follow the setup guide**, which opens the first time:
    1. **Find PS5**: consoles on your network are listed with their name and whether they are on
       or in rest mode (or type the address).
-   2. **Sign in**: Sony's sign-in page opens in your browser to get your account ID (see step 2).
-   3. **Link**: open Settings › System › Remote Play › Link Device on the PS5 and type the 8 digit
-      code. The console's details are saved and kept.
-   4. **Test**: the app connects once; if your PS5 user has a login passcode, it asks for it here.
-5. On the **Play** tab press **Connect**.
+   2. **Sign in**: press **Sign in with PlayStation…**. Sony's sign-in page opens in your
+      browser; sign in, and when the page shows "redirect", copy the address bar. The app notices
+      the copied address and gets your account ID from Sony (see [below](#is-signing-in-safe)).
+   3. **Link**: on the PS5 open Settings › System › Remote Play › **Link Device** and type the
+      8-digit code into the app.
+   4. **Test**: the app connects once. If your PS5 user has a login passcode, it asks for it here.
+4. **Play**: on the Play tab press **Connect**. The window takes over your keyboard and mouse.
+   **F8** gives you your mouse back (press it again to continue playing), **F12** disconnects.
+
+### Default keys
+
+Two profiles come ready to use; the Bindings tab shows and changes every key.
+
+| Shooter (starts with this one) | | Menu | |
+|---|---|---|---|
+| W A S D | left stick | W A S D, arrows | D-pad |
+| Mouse | right stick (aim) | Enter, Space, left click | ✕ (cross) |
+| Left click / right click | R2 fire / L2 aim | Backspace, right click | ○ (circle) |
+| Space | ✕ jump | Q / E | L1 / R1 |
+| C | ○ crouch | Esc | Options |
+| R, F | □ reload / interact | Tab | Touchpad |
+| 1, wheel | △ switch weapon | Home | PS button |
+| Q | L1 | **F1** | switch to Shooter |
+| E, G | R1 | | |
+| LShift / V, middle click | L3 sprint / R3 melee | | |
+| LCtrl (hold) | walk slowly | | |
+| Arrows, Z / X, Mouse 4 / 5 | D-pad | | |
+| Esc / Backspace / Tab / Home | Options / Create / Touchpad / PS | | |
+| **F2** | switch to Menu | | |
+
+### Is signing in safe?
+
+Your password is only typed into Sony's own site in your own browser, never into this app (there
+is no embedded login window). Only an address on Sony's exact redirect page is accepted. The
+one-time code it contains is exchanged once with Sony over verified HTTPS and is never logged or
+saved, and the clipboard is cleared after it is read. Only the account ID itself is kept, in your
+config file on this PC. If you already use chiaki-ng, you can paste its base64 "PSN Account-ID"
+instead of signing in.
 
 ## The window and tray
 
@@ -94,6 +103,7 @@ The window is the default; the command line still works without it:
 
 ```
 chiaki-controller init
+chiaki-controller account-id # sign in with PlayStation, prints your account ID
 chiaki-controller register --host 192.168.1.50 --pin 12345678 --account-id <id>
 chiaki-controller run        # session + a small capture window, no settings window
 chiaki-controller wake | sleep | status | keys
@@ -140,6 +150,33 @@ holds its action for `input.wheel_press_ms`.
 `[stream]` sets the requested resolution / fps / bitrate, DualSense vs DualShock 4, and automatic
 reconnect. `[console]` holds the address, the credentials, `wake` and an optional `login_pin` for
 consoles with a PSN login passcode.
+
+## How it works
+
+It is a port of the protocol parts of [chiaki-ng](https://github.com/streetpea/chiaki-ng)
+(registration, session/ctrl, Takion transport, stream crypto, feedback packets), reduced to PS5
+and Windows.
+
+Why it's low latency:
+
+- Every input change is sent the moment the Raw Input event arrives: the window hands it straight
+  to the input thread, which applies the bindings and sends at once (events that arrive together
+  go out as one update). Button changes go out as feedback-history packets, stick changes as
+  feedback-state packets.
+- Lost button releases are covered by resending the newest history packet 20/50/100/200 ms later
+  (same scheme as chiaki-ng), so nothing gets stuck.
+- Video and audio packets are dropped after reading one byte: no MAC check, no decryption, no
+  decode. The client asks for the smallest stream (360p, 30 fps, 2 Mbps) so the console and
+  network have little to send. (The console always streams video; it can't be turned off.)
+- Mouse to stick conversion runs at 500 Hz with a 1 ms system timer.
+
+## Building from source
+
+```
+cargo build --release
+```
+
+The program is `target\release\chiaki-controller.exe`.
 
 ## Limitations
 
