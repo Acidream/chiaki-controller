@@ -128,5 +128,5 @@ tests, and a loopback test that plays the console side of a Takion handshake.
 
 ## License
 
-AGPL-3.0, like chiaki-ng, which this is derived from. `src/rpcrypt_tables.rs` holds key tables
+AGPL-3.0 (see [LICENSE](LICENSE)), like chiaki-ng, which this is derived from. `src/rpcrypt_tables.rs` holds key tables
 extracted from chiaki-ng's `lib/src/rpcrypt.c`.
