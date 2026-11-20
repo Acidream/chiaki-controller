@@ -26,9 +26,16 @@ and Windows.
 1. On the PS5: Settings > System > Remote Play > enable Remote Play. For waking from rest mode,
    also enable Settings > System > Power Saving > Features Available in Rest Mode > Stay Connected
    to the Internet and Enable Turning On PS5 from Network.
-2. Get your PSN account id. If you already use chiaki-ng, it is the base64 "PSN Account-ID" in
-   its settings. Otherwise follow chiaki-ng's documentation for obtaining it. The decimal number
-   works too.
+2. Your PSN account ID is looked up for you: in the app press **Get my account ID…** next to the
+   account ID field (or run `chiaki-controller account-id`). Sony's sign-in page opens in your own
+   browser; sign in there, and when the page shows "redirect", copy the address bar. The app picks
+   the address up from the clipboard and asks Sony for the ID. If you already use chiaki-ng, its
+   base64 "PSN Account-ID" works too.
+
+   How this stays safe: your password is only typed into Sony's site, never into this app (there
+   is no embedded login window). Only an address on Sony's exact redirect page is accepted. The
+   one-time code it contains is exchanged once with Sony over verified HTTPS and is never logged
+   or saved, and the clipboard is cleared after it is read. Only the account ID itself is kept.
 3. Build: `cargo build --release` (the binary is `target\release\chiaki-controller.exe`).
 4. Start `chiaki-controller.exe` (no arguments). The settings window opens on the **Console** tab:
    enter the console address, the 8 digit code from Settings > System > Remote Play > Link Device,

@@ -9,6 +9,7 @@ mod http;
 mod input;
 mod logbuf;
 mod proto;
+mod psn;
 mod regist;
 mod rpcrypt;
 mod rpcrypt_tables;
@@ -67,6 +68,8 @@ enum Command {
     Gui,
     /// Connect and send controller input, without the settings window
     Run,
+    /// Look up your PSN account ID (sign in on Sony's page in your browser)
+    AccountId,
     /// Wake the PS5 from rest mode
     Wake,
     /// Put the PS5 into rest mode
@@ -217,6 +220,25 @@ fn real_main(cli: Cli) -> Result<()> {
                 reg.mac,
                 config_path.display()
             );
+            Ok(())
+        }
+        Command::AccountId => {
+            println!("1. Sign in on Sony's page (opening it in your browser now). Your password goes only to Sony.");
+            println!("   If it doesn't open, copy this address into your browser:
+   {}
+", psn::LOGIN_URL);
+            if let Err(e) = psn::open_login_page() {
+                log::warn!("{e:#}");
+            }
+            println!("2. After signing in, the page says \"redirect\". Copy the address from the address bar,");
+            println!("   paste it here and press Enter:");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            let code = psn::code_from_redirect(&line)?;
+            let id = psn::account_id_from_code(&code)?;
+            println!("
+Your PSN account ID: {}   (as a number: {})", id.base64, id.number);
+            println!("Use it with: chiaki-controller register --host <PS5 address> --pin <code> --account-id {}", id.base64);
             Ok(())
         }
         Command::Keys => {

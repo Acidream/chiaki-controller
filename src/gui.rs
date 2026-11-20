@@ -16,7 +16,7 @@ use eframe::egui;
 use crate::config::{Binding, BindingDetail, Config, MouseTarget, Profile};
 use crate::input::{keys, mapper::Mapper};
 use crate::runner::{resolve_host, Runner};
-use crate::{http, logbuf, regist, session};
+use crate::{http, logbuf, psn, regist, session};
 
 // ---------------------------------------------------------------------------------------------
 // Session control shared between the window and the tray handlers
@@ -239,6 +239,19 @@ enum Tab {
 enum TaskResult {
     Message(String),
     Registered(Box<regist::Registered>, String),
+    AccountId(Result<psn::AccountId, String>),
+}
+
+/// State of the "Get my account ID" helper.
+#[derive(Default)]
+struct AccountFlow {
+    active: bool,
+    busy: bool,
+    error: String,
+    paste: String,
+    /// clipboard text when the flow started; only a newly copied address counts
+    clipboard_baseline: Option<String>,
+    last_poll: Option<std::time::Instant>,
 }
 
 pub struct GuiApp {
@@ -262,6 +275,7 @@ pub struct GuiApp {
     reg_host: String,
     reg_pin: String,
     reg_account: String,
+    account: AccountFlow,
     all_inputs: Vec<String>,
 }
 
@@ -319,6 +333,7 @@ impl GuiApp {
             tasks: Vec::new(),
             reg_pin: String::new(),
             reg_account: String::new(),
+            account: AccountFlow::default(),
             all_inputs: keys::all_names(),
         };
         if app.cfg.console.regist_key.is_empty() {
@@ -461,6 +476,17 @@ impl GuiApp {
             self.tasks.remove(i);
             match r {
                 Some(TaskResult::Message(m)) => self.message = m,
+                Some(TaskResult::AccountId(r)) => {
+                    self.account.busy = false;
+                    match r {
+                        Ok(id) => {
+                            self.reg_account = id.base64;
+                            self.account = AccountFlow::default();
+                            self.message = "Got your PSN account ID from Sony".into();
+                        }
+                        Err(e) => self.account.error = e,
+                    }
+                }
                 Some(TaskResult::Registered(reg, host)) => {
                     // keep the console parameters: write them straight into the saved config
                     self.cfg.console.host = host;
@@ -481,6 +507,38 @@ impl GuiApp {
                 None => {}
             }
         }
+    }
+
+    fn exchange_redirect(&mut self, url: &str) {
+        match psn::code_from_redirect(url) {
+            Ok(code) => {
+                self.account.busy = true;
+                self.account.error.clear();
+                self.account.paste.clear();
+                self.spawn_task(move || TaskResult::AccountId(psn::account_id_from_code(&code).map_err(|e| format!("{e:#}"))));
+            }
+            Err(e) => self.account.error = format!("{e:#}"),
+        }
+    }
+
+    /// While the account helper waits, pick the redirect address up from the clipboard.
+    fn poll_account_clipboard(&mut self) {
+        if !self.account.active || self.account.busy {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.account.last_poll.map(|t| now.duration_since(t) < Duration::from_millis(400)).unwrap_or(false) {
+            return;
+        }
+        self.account.last_poll = Some(now);
+        let Some(text) = psn::clipboard::text() else { return };
+        if Some(&text) == self.account.clipboard_baseline.as_ref() || !psn::looks_like_redirect(&text) {
+            return;
+        }
+        // the code is single use; don't leave it lying around on the clipboard
+        psn::clipboard::clear();
+        self.account.clipboard_baseline = None;
+        self.exchange_redirect(&text);
     }
 
     fn handle_listen(&mut self, ctx: &egui::Context) {
@@ -747,10 +805,25 @@ impl GuiApp {
                 ui.label("Code (8 digits)");
                 ui.text_edit_singleline(&mut self.reg_pin);
                 ui.end_row();
-                ui.label("PSN account id");
-                ui.add(egui::TextEdit::singleline(&mut self.reg_account).hint_text("base64 or decimal"));
+                ui.label("PSN account ID");
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.reg_account).hint_text("base64 or decimal"));
+                    if ui.button("Get my account ID…").clicked() {
+                        self.account = AccountFlow {
+                            active: true,
+                            clipboard_baseline: psn::clipboard::text(),
+                            ..Default::default()
+                        };
+                        if let Err(e) = psn::open_login_page() {
+                            self.account.error = format!("{e:#}");
+                        }
+                    }
+                });
                 ui.end_row();
             });
+            if self.account.active {
+                ui.group(|ui| self.ui_account_flow(ui));
+            }
             if ui.button("Register").clicked() {
                 let (host, pin, account) = (self.reg_host.trim().to_string(), self.reg_pin.trim().to_string(), self.reg_account.clone());
                 self.message = "Registering…".into();
@@ -768,6 +841,52 @@ impl GuiApp {
                 });
             }
         });
+    }
+
+    fn ui_account_flow(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Get your PSN account ID");
+        ui.label("1. Your browser opened Sony's sign-in page. Sign in there. Your password goes only to Sony, never to this app.");
+        ui.horizontal(|ui| {
+            ui.label("   Check the address bar shows");
+            ui.monospace("auth.api.sonyentertainmentnetwork.com");
+            if ui.small_button("open again").clicked() {
+                if let Err(e) = psn::open_login_page() {
+                    self.account.error = format!("{e:#}");
+                }
+            }
+        });
+        ui.label("2. After signing in, the page just says \"redirect\". Copy the address from the address bar (Ctrl+L, Ctrl+C).");
+        ui.label("3. That's it: this app notices the copied address and asks Sony for your account ID. Or paste it here:");
+        ui.horizontal(|ui| {
+            ui.add_enabled(
+                !self.account.busy,
+                egui::TextEdit::singleline(&mut self.account.paste)
+                    .hint_text("https://remoteplay.dl.playstation.net/remoteplay/redirect?code=…")
+                    .desired_width(380.0),
+            );
+            if ui.add_enabled(!self.account.busy && !self.account.paste.trim().is_empty(), egui::Button::new("Use")).clicked() {
+                let url = self.account.paste.clone();
+                self.exchange_redirect(&url);
+            }
+            if ui.button("Cancel").clicked() {
+                self.account = AccountFlow::default();
+            }
+        });
+        if self.account.busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Asking Sony for your account ID…");
+            });
+        } else if self.account.active {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak("Waiting for the copied address…");
+            });
+        }
+        if !self.account.error.is_empty() {
+            ui.colored_label(egui::Color32::from_rgb(0xdc, 0x26, 0x26), &self.account.error);
+        }
+        ui.weak("The one-time code is used once and never saved. Only your account ID is kept, in the field above.");
     }
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
@@ -1079,6 +1198,7 @@ impl eframe::App for GuiApp {
             hide_window(self.hwnd);
         }
         self.poll_tasks();
+        self.poll_account_clipboard();
         self.handle_listen(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -1138,7 +1258,7 @@ impl eframe::App for GuiApp {
             Tab::Bindings => self.ui_bindings(ui),
         });
 
-        let busy = !self.tasks.is_empty() || self.listen.is_some() || {
+        let busy = !self.tasks.is_empty() || self.listen.is_some() || self.account.active || {
             let sh = self.shared.lock().unwrap();
             sh.runner.is_some() || !sh.stopping.is_empty()
         };
