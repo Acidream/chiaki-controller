@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, DrawTextW, EndPaint, FillRect, GetSysColorBrush, InvalidateRect, SetBkMode, SetTextColor,
-    COLOR_WINDOW, DT_LEFT, DT_NOPREFIX, DT_WORDBREAK, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, ClientToScreen, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetSysColorBrush,
+    InvalidateRect, SelectObject, SetBkMode, SetTextColor, COLOR_WINDOW, DT_LEFT, DT_NOPREFIX, DT_WORDBREAK, HDC, PAINTSTRUCT,
+    TRANSPARENT,
 };
 use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -68,6 +69,7 @@ struct App {
     last_abs: Option<(i32, i32)>,
     last_input: String,
     dirty: bool,
+    active_profile: Arc<Mutex<String>>,
 }
 
 thread_local! {
@@ -253,6 +255,10 @@ impl App {
     }
 
     fn paint(&self) {
+        // colours are 0x00BBGGRR
+        const GREEN: u32 = 0x004aa316;
+        const AMBER: u32 = 0x000b9ef5;
+        const SLATE: u32 = 0x00554b47;
         unsafe {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let hdc = BeginPaint(self.hwnd, &mut ps);
@@ -260,26 +266,60 @@ impl App {
             GetClientRect(self.hwnd, &mut rc);
             FillRect(hdc, &rc, GetSysColorBrush(COLOR_WINDOW));
             SetBkMode(hdc, TRANSPARENT as i32);
+
+            let streaming = self.link.is_streaming();
+            let capture = keys::name(self.capture_key);
+            let quit = keys::name(self.quit_key);
+            let (band, headline, sub) = match (self.capturing, streaming) {
+                (true, true) => (
+                    GREEN,
+                    "Keyboard and mouse control your PS5".to_string(),
+                    format!("{capture} gives you your mouse back  ·  {quit} disconnects"),
+                ),
+                (true, false) => (
+                    AMBER,
+                    "Waiting for the PS5…".to_string(),
+                    format!("Input is captured and goes to the PS5 once connected  ·  {capture} releases"),
+                ),
+                (false, _) => (
+                    SLATE,
+                    "Mouse released: the PS5 gets no input".to_string(),
+                    format!("Press {capture} or click here to control the PS5 again  ·  {quit} disconnects"),
+                ),
+            };
+
+            // coloured banner
+            let band_rc = RECT { left: 0, top: 0, right: rc.right, bottom: 70 };
+            let brush = CreateSolidBrush(band);
+            FillRect(hdc, &band_rc, brush);
+            DeleteObject(brush as _);
+            SetTextColor(hdc, 0x00ffffff);
+            draw(hdc, &headline, RECT { left: 14, top: 10, right: rc.right - 14, bottom: 40 }, 22, true);
+            draw(hdc, &sub, RECT { left: 14, top: 42, right: rc.right - 14, bottom: 68 }, 15, false);
+
+            // body
             SetTextColor(hdc, 0x00202020);
+            draw(hdc, &format!("Profile: {}", self.mapper.profile_name()), RECT { left: 14, top: 82, right: rc.right - 14, bottom: 110 }, 18, true);
             let status = self.status.lock().map(|s| s.clone()).unwrap_or_default();
-            let text = format!(
-                "{}\n\nInput: {}   Profile: {}\n{} toggles capture, {} quits.{}\n{}",
-                status,
-                if self.capturing { "CAPTURED" } else { "released (click here to capture)" },
-                self.mapper.profile_name(),
-                keys::name(self.capture_key),
-                keys::name(self.quit_key),
-                if self.link.is_streaming() { "" } else { "  (not streaming yet)" },
-                if self.last_input.is_empty() { String::new() } else { format!("Last input: {}", self.last_input) },
-            );
-            let mut w: Vec<u16> = text.encode_utf16().collect();
-            rc.left += 12;
-            rc.top += 10;
-            rc.right -= 12;
-            DrawTextW(hdc, w.as_mut_ptr(), w.len() as i32, &mut rc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            let mut body = status;
+            if !self.last_input.is_empty() && self.capturing {
+                body.push_str(&format!("\nLast key: {}", self.last_input));
+            }
+            draw(hdc, &body, RECT { left: 14, top: 114, right: rc.right - 14, bottom: rc.bottom - 6 }, 15, false);
             EndPaint(self.hwnd, &ps);
         }
     }
+}
+
+/// Draws wrapped text with Segoe UI at `px` pixels.
+unsafe fn draw(hdc: HDC, text: &str, mut rc: RECT, px: i32, bold: bool) {
+    let face = wide("Segoe UI");
+    let font = CreateFontW(-px, 0, 0, 0, if bold { 700 } else { 400 }, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
+    let old = SelectObject(hdc, font as _);
+    let mut w: Vec<u16> = text.encode_utf16().collect();
+    DrawTextW(hdc, w.as_mut_ptr(), w.len() as i32, &mut rc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+    SelectObject(hdc, old);
+    DeleteObject(font as _);
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -361,6 +401,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
 }
 
 pub struct UiOptions {
+    /// receives the name of the active profile whenever it changes
+    pub active_profile: Arc<Mutex<String>>,
     pub capture_key: InputId,
     pub quit_key: InputId,
     pub capture_on_start: bool,
@@ -397,7 +439,7 @@ pub fn run(
         if RegisterClassExW(&wc) == 0 && windows_sys::Win32::Foundation::GetLastError() != 1410 {
             bail!("RegisterClassExW failed: {}", std::io::Error::last_os_error());
         }
-        let title = wide("chiaki-controller");
+        let title = wide("chiaki-controller: controlling the PS5");
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
@@ -405,8 +447,8 @@ pub fn run(
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            560,
-            260,
+            600,
+            250,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinstance,
@@ -433,6 +475,7 @@ pub fn run(
                 last_abs: None,
                 last_input: String::new(),
                 dirty: true,
+                active_profile: opts.active_profile.clone(),
             });
         });
         ShowWindow(hwnd, SW_SHOW);
@@ -462,6 +505,12 @@ pub fn run(
             }
             APP.with(|c| {
                 if let Some(app) = c.borrow_mut().as_mut() {
+                    // report profile switches (keys or wheel) to the settings window
+                    if let Ok(mut p) = app.active_profile.lock() {
+                        if *p != app.mapper.profile_name() {
+                            *p = app.mapper.profile_name().to_string();
+                        }
+                    }
                     if app.dirty || app.mapper.needs_ticks() {
                         app.dirty = false;
                         let st = app.mapper.state(Instant::now());

@@ -156,3 +156,79 @@ pub fn probe(ip: IpAddr) -> Result<String> {
     let status = text.lines().next().unwrap_or("").trim_start_matches("HTTP/1.1 ").to_string();
     Ok(status)
 }
+
+/// A console that answered the network search.
+#[derive(Clone, Debug)]
+pub struct FoundConsole {
+    pub ip: IpAddr,
+    pub name: String,
+    /// true = running, false = rest mode
+    pub awake: bool,
+}
+
+/// The local IPv4 address used to reach the LAN (no packet is sent).
+fn local_ipv4() -> Option<std::net::Ipv4Addr> {
+    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:9").ok()?; // TEST-NET address: only selects the route
+    match s.local_addr().ok()?.ip() {
+        IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => Some(v4),
+        _ => None,
+    }
+}
+
+/// Searches the local network for PS5 consoles for `wait`.
+pub fn discover(wait: Duration) -> Result<Vec<FoundConsole>> {
+    let udp = UdpSocket::bind("0.0.0.0:0")?;
+    udp.set_broadcast(true)?;
+    let query = b"SRCH * HTTP/1.1\ndevice-discovery-protocol-version:00030010\n";
+    let mut targets: Vec<std::net::Ipv4Addr> = vec![std::net::Ipv4Addr::BROADCAST];
+    if let Some(local) = local_ipv4() {
+        // Windows may send the limited broadcast on another adapter; also use the /24 one
+        let o = local.octets();
+        targets.push(std::net::Ipv4Addr::new(o[0], o[1], o[2], 255));
+    }
+    let deadline = Instant::now() + wait;
+    let mut found: Vec<FoundConsole> = Vec::new();
+    let mut next_send = Instant::now();
+    let mut buf = [0u8; 1024];
+    while Instant::now() < deadline {
+        if Instant::now() >= next_send {
+            for t in &targets {
+                let _ = udp.send_to(query, SocketAddr::new(IpAddr::V4(*t), 9302));
+            }
+            next_send = Instant::now() + Duration::from_millis(700);
+        }
+        let left = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(200));
+        if left.is_zero() {
+            break;
+        }
+        udp.set_read_timeout(Some(left))?;
+        let Ok((n, from)) = udp.recv_from(&mut buf) else { continue };
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        let headers = http::parse_headers(&text);
+        let get = |k: &str| headers.iter().find(|(key, _)| key == k).map(|(_, v)| v.trim().to_string());
+        if get("host-type").as_deref() != Some("PS5") || found.iter().any(|f| f.ip == from.ip()) {
+            continue;
+        }
+        let status = text.lines().next().unwrap_or("");
+        found.push(FoundConsole {
+            ip: from.ip(),
+            name: get("host-name").unwrap_or_else(|| "PS5".into()),
+            awake: status.contains(" 200 "),
+        });
+    }
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(found)
+}
+
+#[cfg(test)]
+mod network_tests {
+    /// Looks for consoles on the LAN; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn discover_lan() {
+        for c in super::discover(std::time::Duration::from_secs(2)).unwrap() {
+            println!("found {} at {} ({})", c.name, c.ip, if c.awake { "on" } else { "rest mode" });
+        }
+    }
+}

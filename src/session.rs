@@ -43,6 +43,45 @@ fn application_reason(reason: u32) -> &'static str {
     }
 }
 
+/// The console answered the session request but refused it.
+#[derive(Debug)]
+pub struct SessionRejected {
+    pub http: u16,
+    pub reason: u32,
+}
+
+impl std::fmt::Display for SessionRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "session request rejected (HTTP {}, reason {:#x}: {})", self.http, self.reason, application_reason(self.reason))
+    }
+}
+
+impl std::error::Error for SessionRejected {}
+
+impl SessionRejected {
+    pub fn in_use(&self) -> bool {
+        self.reason == 0x80108b10
+    }
+}
+
+/// The console wants the PS5 user's login passcode.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoginError {
+    PasscodeNeeded,
+    PasscodeWrong,
+}
+
+impl std::fmt::Display for LoginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoginError::PasscodeNeeded => write!(f, "the console asked for the PS5 login passcode"),
+            LoginError::PasscodeWrong => write!(f, "the console rejected the login passcode"),
+        }
+    }
+}
+
+impl std::error::Error for LoginError {}
+
 fn connect_tcp(ip: IpAddr) -> Result<TcpStream> {
     let addr = SocketAddr::new(ip, SESSION_PORT);
     let s = TcpStream::connect_timeout(&addr, TIMEOUT)
@@ -74,11 +113,7 @@ pub fn request_session(ip: IpAddr, creds: &Credentials) -> Result<[u8; 16]> {
             .header("RP-Application-Reason")
             .and_then(|r| u32::from_str_radix(r.trim_start_matches("0x"), 16).ok())
             .unwrap_or(0);
-        bail!(
-            "session request rejected (HTTP {}, reason {reason:#x}: {})",
-            resp.code,
-            application_reason(reason)
-        );
+        return Err(SessionRejected { http: resp.code, reason }.into());
     }
     let nonce_b64 = resp.header("RP-Nonce").context("session response has no RP-Nonce")?;
     let nonce = B64.decode(nonce_b64.trim()).context("invalid RP-Nonce")?;
@@ -263,11 +298,11 @@ impl Ctrl {
                                         let _ = w.send(CTRL_LOGIN_PIN_REP, pin.as_bytes());
                                         pin_sent = true;
                                     }
-                                    _ => {
+                                    (_, sent) => {
+                                        // asked again after we sent one: it was wrong
+                                        let e = if sent { LoginError::PasscodeWrong } else { LoginError::PasscodeNeeded };
                                         if let Some(tx) = session_tx.take() {
-                                            let _ = tx.send(Err(anyhow!(
-                                                "console asked for the PSN login passcode; set console.login_pin in the config"
-                                            )));
+                                            let _ = tx.send(Err(e.into()));
                                         }
                                         failed.store(true, Ordering::Relaxed);
                                         break 'outer;
@@ -277,7 +312,7 @@ impl Ctrl {
                             CTRL_LOGIN => {
                                 if payload.first() == Some(&1) {
                                     if let Some(tx) = session_tx.take() {
-                                        let _ = tx.send(Err(anyhow!("console rejected the login passcode")));
+                                        let _ = tx.send(Err(LoginError::PasscodeWrong.into()));
                                     }
                                     failed.store(true, Ordering::Relaxed);
                                     break 'outer;

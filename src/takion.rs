@@ -56,6 +56,8 @@ pub struct Takion {
     tag_remote: u32,
     send: Mutex<SendState>,
     recv: Mutex<RecvState>,
+    /// when the current run of unexpected receive errors began
+    recv_error_since: Mutex<Option<Instant>>,
 }
 
 struct RecvState {
@@ -72,6 +74,17 @@ pub struct DataMessage {
     pub data_type: u8,
     pub payload: Vec<u8>,
 }
+
+/// Receive errors that mean "nothing this time" rather than a broken connection.
+/// Windows sometimes reports ERROR_IO_PENDING (997) instead of a timeout for a blocking recv
+/// with a short SO_RCVTIMEO, and WSAEMSGSIZE (10040) for a datagram larger than the buffer.
+fn is_transient(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted)
+        || matches!(e.raw_os_error(), Some(997) | Some(10040))
+}
+
+/// How long receive errors may go on before the connection counts as broken.
+const RECV_ERROR_GRACE: Duration = Duration::from_secs(2);
 
 fn seq_lt(a: u32, b: u32) -> bool {
     a != b && b.wrapping_sub(a) < 0x8000_0000
@@ -205,6 +218,7 @@ impl Takion {
                 unacked: BTreeMap::new(),
             }),
             recv: Mutex::new(RecvState { expected_seq: tag_remote, pending: BTreeMap::new() }),
+            recv_error_since: Mutex::new(None),
         })
     }
 
@@ -220,7 +234,7 @@ impl Takion {
             sock.set_read_timeout(Some(left))?;
             let n = match sock.recv(&mut buf) {
                 Ok(n) => n,
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+                Err(e) if is_transient(&e) => continue,
                 Err(e) => return Err(e).context("Takion recv"),
             };
             if n < 1 || buf[0] != PACKET_TYPE_CONTROL {
@@ -410,13 +424,23 @@ impl Takion {
     /// messages that became deliverable in order. Times out per the socket read timeout.
     pub fn poll(&self, buf: &mut [u8]) -> Result<Vec<DataMessage>> {
         let n = match self.sock.recv(buf) {
-            Ok(n) => n,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                return Ok(Vec::new())
+            Ok(n) => {
+                *self.recv_error_since.lock().unwrap() = None;
+                n
             }
+            Err(e) if is_transient(&e) => return Ok(Vec::new()),
             // Windows reports ICMP port unreachable as a reset on the next recv
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => bail!("console closed the stream port"),
-            Err(e) => return Err(e).context("Takion recv"),
+            Err(e) => {
+                // an unexpected error: only give up when it keeps happening
+                let mut since = self.recv_error_since.lock().unwrap();
+                let first = *since.get_or_insert_with(Instant::now);
+                if first.elapsed() < RECV_ERROR_GRACE {
+                    log::debug!("Takion recv error (ignored for now): {e}");
+                    return Ok(Vec::new());
+                }
+                return Err(e).context("Takion recv");
+            }
         };
         if n == 0 || buf[0] & 0xf != PACKET_TYPE_CONTROL {
             // video, audio and anything else: not needed for input-only streaming
@@ -620,4 +644,15 @@ mod sys {
 #[cfg(not(windows))]
 mod sys {
     pub fn set_recv_buffer(_sock: &std::net::UdpSocket, _size: i32) {}
+}
+
+#[cfg(test)]
+mod recv_error_tests {
+    #[test]
+    fn spurious_windows_errors_are_transient() {
+        assert!(super::is_transient(&std::io::Error::from_raw_os_error(997)));
+        assert!(super::is_transient(&std::io::Error::from_raw_os_error(10040)));
+        assert!(super::is_transient(&std::io::Error::from(std::io::ErrorKind::TimedOut)));
+        assert!(!super::is_transient(&std::io::Error::from(std::io::ErrorKind::ConnectionReset)));
+    }
 }

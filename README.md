@@ -37,31 +37,42 @@ and Windows.
    one-time code it contains is exchanged once with Sony over verified HTTPS and is never logged
    or saved, and the clipboard is cleared after it is read. Only the account ID itself is kept.
 3. Build: `cargo build --release` (the binary is `target\release\chiaki-controller.exe`).
-4. Start `chiaki-controller.exe` (no arguments). The settings window opens on the **Console** tab:
-   enter the console address, the 8 digit code from Settings > System > Remote Play > Link Device,
-   and your account id, then press **Register**. The console parameters (address, keys, name) are
-   saved to the config right away and kept from then on.
-5. On the **Run** tab press **Start**.
+4. Start `chiaki-controller.exe` (no arguments). A setup guide opens the first time:
+   1. **Find PS5**: consoles on your network are listed with their name and whether they are on
+      or in rest mode (or type the address).
+   2. **Sign in**: Sony's sign-in page opens in your browser to get your account ID (see step 2).
+   3. **Link**: open Settings › System › Remote Play › Link Device on the PS5 and type the 8 digit
+      code. The console's details are saved and kept.
+   4. **Test**: the app connects once; if your PS5 user has a login passcode, it asks for it here.
+5. On the **Play** tab press **Connect**.
 
-## The settings window and tray
+## The window and tray
 
-- **Run**: start / stop the session, connection status, live log.
-- **Console**: console address and credentials, login passcode, wake from rest mode; register a
-  console; check status, wake it up, or put it into rest mode.
+- **Play**: one Connect / Disconnect button and what's happening in plain words (waking the PS5,
+  connecting, signing in, connected). Problems are explained with what to do, for example
+  "Can't reach the PS5", "Remote Play is already in use", "Your PS5 asks for your login passcode"
+  (with a field to enter it right there) or "The PS5 doesn't recognise this PC" (with a button to
+  link again). The technical details and the log are folded away underneath. While connected, a
+  live controller drawing shows exactly what the PS5 receives.
+- **Console**: the linked PS5, login passcode, wake from rest mode, check status / wake up / rest
+  mode, and "Link a different PS5…". Address and pairing keys are under *Advanced*.
 - **Settings**: requested video size (never decoded), DualSense vs DualShock 4, reconnect, the
-  capture / end-session keys, and program options (start in the tray, start a session on launch).
+  release-mouse and disconnect keys, and program options (start in the tray, connect on launch).
 - **Bindings**: profiles (new, duplicate, rename, delete), mouse settings with sliders, and the
   bindings table. Click **set** next to an input and press the key, mouse button or wheel you
   want, pick the action, and adjust amount / toggle / turbo. Duplicate inputs are flagged.
 
 **Save** writes everything to the config file (unsaved changes are marked; **Revert** reloads it).
-While a session runs, **Save & restart** applies new settings.
+While connected, **Save changes & reconnect** applies new settings.
 
-Closing the window hides it to the tray. The tray icon's menu has Settings, Start, Stop and Quit;
-left-clicking the icon opens the settings. Starting from the tray uses the saved config.
+Closing the window hides it to the tray. The tray icon shows the state by colour (blue: not
+connected, amber: connecting, green: connected, red: needs attention) and in its tooltip; its menu
+has Open, Connect, Disconnect and Quit.
 
-During a session a small capture window grabs keyboard and mouse: **F8** releases / recaptures
-(or click it), **F12** ends the session. Capture is released automatically when it loses focus.
+While connected, a small capture window takes over keyboard and mouse. Its banner says what's
+going on: green "Keyboard and mouse control your PS5", amber "Waiting for the PS5…", or grey
+"Mouse released". **F8** releases / recaptures (or click it), **F12** disconnects. Capture is
+released automatically when it loses focus.
 
 The config lives in `chiaki-controller.toml` in the current directory or next to the program if
 one exists there, otherwise in `%APPDATA%\chiaki-controller\`.

@@ -211,6 +211,11 @@ impl ControllerLink {
         }
     }
 
+    /// The controller state as last set (for the live preview).
+    pub fn state(&self) -> ControllerState {
+        self.inner.lock().unwrap().state
+    }
+
     pub fn is_streaming(&self) -> bool {
         self.inner.lock().unwrap().sender.is_some()
     }

@@ -15,8 +15,12 @@ use eframe::egui;
 
 use crate::config::{Binding, BindingDetail, Config, MouseTarget, Profile};
 use crate::input::{keys, mapper::Mapper};
-use crate::runner::{resolve_host, Runner};
-use crate::{http, logbuf, psn, regist, session};
+use crate::controller::ControllerState;
+use crate::runner::{resolve_host, Phase, ProblemKind, RunState, Runner};
+
+mod preview;
+mod wizard;
+use crate::{logbuf, psn, regist, session};
 
 // ---------------------------------------------------------------------------------------------
 // Session control shared between the window and the tray handlers
@@ -25,12 +29,25 @@ struct Shared {
     runner: Option<Runner>,
     stopping: Vec<JoinHandle<()>>,
     cfg_path: PathBuf,
+    /// state of the last session that ended on its own (its problem stays visible)
+    last_state: Option<RunState>,
+}
+
+/// What the window and tray show about the session.
+struct Snapshot {
+    running: bool,
+    stopping: bool,
+    state: Option<RunState>,
+    controller: Option<ControllerState>,
+    /// active profile and the config of the running session
+    profile: Option<(String, Arc<Config>)>,
 }
 
 impl Shared {
     fn reap(&mut self) {
         if self.runner.as_ref().map(|r| r.is_finished()).unwrap_or(false) {
             if let Some(r) = self.runner.take() {
+                self.last_state = Some(r.run_state());
                 self.stopping.push(thread::spawn(move || {
                     let _ = r.stop_and_wait();
                 }));
@@ -52,11 +69,29 @@ impl Shared {
             bail!("the previous session is still shutting down, try again in a moment");
         }
         logbuf::clear();
+        self.last_state = None;
         self.runner = Some(Runner::start(cfg)?);
         Ok(())
     }
 
+    fn snapshot(&mut self) -> Snapshot {
+        self.reap();
+        self.peek()
+    }
+
+    /// Like `snapshot` without side effects (for the tray timer).
+    fn peek(&self) -> Snapshot {
+        Snapshot {
+            running: self.running(),
+            stopping: !self.stopping.is_empty(),
+            state: self.runner.as_ref().map(|r| r.run_state()).or_else(|| self.last_state.clone()),
+            controller: self.runner.as_ref().filter(|r| r.is_streaming()).map(|r| r.controller_state()),
+            profile: self.runner.as_ref().map(|r| (r.active_profile(), r.config())),
+        }
+    }
+
     fn stop(&mut self) {
+        self.last_state = None;
         if let Some(r) = self.runner.take() {
             r.request_stop();
             self.stopping.push(thread::spawn(move || {
@@ -94,8 +129,17 @@ fn hide_window(hwnd: isize) {
     }
 }
 
-/// A simple round controller-ish icon.
+const BLUE: (u8, u8, u8) = (0x25, 0x63, 0xeb);
+const AMBER: (u8, u8, u8) = (0xf5, 0x9e, 0x0b);
+const GREEN: (u8, u8, u8) = (0x16, 0xa3, 0x4a);
+const RED: (u8, u8, u8) = (0xdc, 0x26, 0x26);
+
 fn icon_rgba(size: u32) -> Vec<u8> {
+    icon_rgba_color(size, BLUE)
+}
+
+/// A simple round controller-ish icon.
+fn icon_rgba_color(size: u32, color: (u8, u8, u8)) -> Vec<u8> {
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     let c = (size as f32 - 1.0) / 2.0;
     let r = size as f32 / 2.0 - 0.5;
@@ -113,11 +157,69 @@ fn icon_rgba(size: u32) -> Vec<u8> {
             let (lx, ly) = (dx + s * 0.2, dy);
             let cross = (lx.abs() < s * 0.05 && ly.abs() < s * 0.17) || (ly.abs() < s * 0.05 && lx.abs() < s * 0.17);
             let dot = ((dx - s * 0.2).powi(2) + dy * dy).sqrt() < s * 0.1;
-            let (cr, cg, cb) = if cross || dot { (255, 255, 255) } else { (0x25, 0x63, 0xeb) };
+            let (cr, cg, cb) = if cross || dot { (255, 255, 255) } else { color };
             rgba[i..i + 4].copy_from_slice(&[cr, cg, cb, alpha]);
         }
     }
     rgba
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tray icon status: colour and tooltip follow the session, also while the window is hidden
+// (a Win32 timer on the window keeps running when eframe stops drawing).
+
+struct TrayStatus {
+    tray: tray_icon::TrayIcon,
+    shared: Arc<Mutex<Shared>>,
+    shown: Option<(u8, String)>,
+}
+
+thread_local! {
+    static TRAY: std::cell::RefCell<Option<TrayStatus>> = const { std::cell::RefCell::new(None) };
+}
+
+const TRAY_TIMER_ID: usize = 0xC41A;
+
+impl TrayStatus {
+    fn refresh(&mut self) {
+        let snap = match self.shared.try_lock() {
+            Ok(sh) => sh.peek(),
+            Err(_) => return,
+        };
+        let phase = snap.state.as_ref().map(|s| s.phase.clone());
+        let problem = snap.state.as_ref().and_then(|s| s.problem.clone());
+        let (level, tip) = match (snap.running, phase) {
+            (true, Some(Phase::Ready)) => (2, "Connected - keyboard and mouse control the PS5".to_string()),
+            (true, Some(p)) => (1, p.label()),
+            (true, None) => (1, "Connecting…".to_string()),
+            (false, _) if snap.stopping => (1, "Disconnecting…".to_string()),
+            (false, _) => match problem {
+                Some(p) => (3, p.title),
+                None => (0, "Not connected".to_string()),
+            },
+        };
+        let tip = format!("chiaki-controller: {tip}");
+        let tip: String = tip.chars().take(120).collect();
+        if self.shown.as_ref().map(|(l, t)| *l == level && *t == tip).unwrap_or(false) {
+            return;
+        }
+        let color = [BLUE, AMBER, GREEN, RED][level as usize];
+        if let Ok(icon) = tray_icon::Icon::from_rgba(icon_rgba_color(32, color), 32, 32) {
+            let _ = self.tray.set_icon(Some(icon));
+        }
+        let _ = self.tray.set_tooltip(Some(tip.clone()));
+        self.shown = Some((level, tip));
+    }
+}
+
+unsafe extern "system" fn tray_timer(_: windows_sys::Win32::Foundation::HWND, _: u32, _: usize, _: u32) {
+    TRAY.with(|t| {
+        if let Ok(mut t) = t.try_borrow_mut() {
+            if let Some(ts) = t.as_mut() {
+                ts.refresh();
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -238,7 +340,6 @@ enum Tab {
 
 enum TaskResult {
     Message(String),
-    Registered(Box<regist::Registered>, String),
     AccountId(Result<psn::AccountId, String>),
 }
 
@@ -259,7 +360,6 @@ pub struct GuiApp {
     quit_requested: Arc<AtomicBool>,
     quitting: bool,
     hwnd: isize,
-    _tray: Option<tray_icon::TrayIcon>,
 
     cfg: Config,
     rows: Vec<Vec<BindRow>>,
@@ -272,10 +372,11 @@ pub struct GuiApp {
     login_pin_buf: String,
     message: String,
     tasks: Vec<Receiver<TaskResult>>,
-    reg_host: String,
-    reg_pin: String,
     reg_account: String,
     account: AccountFlow,
+    wizard: Option<wizard::Wizard>,
+    /// passcode typed on the Run tab when the console asks for one
+    run_passcode: String,
     all_inputs: Vec<String>,
 }
 
@@ -305,11 +406,16 @@ impl GuiApp {
             c
         };
 
-        let shared = Arc::new(Mutex::new(Shared { runner: None, stopping: Vec::new(), cfg_path: cfg_path.clone() }));
+        let shared = Arc::new(Mutex::new(Shared { runner: None, stopping: Vec::new(), cfg_path: cfg_path.clone(), last_state: None }));
         let quit_requested = Arc::new(AtomicBool::new(false));
-        let tray = Self::create_tray(&cc.egui_ctx, hwnd, shared.clone(), quit_requested.clone());
-        if let Err(e) = &tray {
-            log::error!("tray icon: {e:#}");
+        match Self::create_tray(&cc.egui_ctx, hwnd, shared.clone(), quit_requested.clone()) {
+            Ok(tray) => {
+                TRAY.with(|t| *t.borrow_mut() = Some(TrayStatus { tray, shared: shared.clone(), shown: None }));
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::SetTimer(hwnd as _, TRAY_TIMER_ID, 500, Some(tray_timer));
+                }
+            }
+            Err(e) => log::error!("tray icon: {e:#}"),
         }
 
         let rows = cfg.profiles.iter().map(rows_from_profile).collect();
@@ -318,9 +424,7 @@ impl GuiApp {
             quit_requested,
             quitting: false,
             hwnd,
-            _tray: tray.ok(),
             login_pin_buf: cfg.console.login_pin.clone().unwrap_or_default(),
-            reg_host: cfg.console.host.clone(),
             cfg,
             rows,
             dirty: false,
@@ -331,13 +435,15 @@ impl GuiApp {
             prev_mods: egui::Modifiers::default(),
             message,
             tasks: Vec::new(),
-            reg_pin: String::new(),
             reg_account: String::new(),
             account: AccountFlow::default(),
+            wizard: None,
+            run_passcode: String::new(),
             all_inputs: keys::all_names(),
         };
-        if app.cfg.console.regist_key.is_empty() {
-            app.tab = Tab::Console;
+        if app.cfg.credentials().is_err() {
+            // nothing linked yet: guide the user through it
+            app.open_wizard();
         }
         if app.cfg.ui.connect_on_launch {
             app.start();
@@ -354,9 +460,9 @@ impl GuiApp {
         use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
         use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-        let show = MenuItem::new("Settings", true, None);
-        let start = MenuItem::new("Start", true, None);
-        let stop = MenuItem::new("Stop", true, None);
+        let show = MenuItem::new("Open chiaki-controller", true, None);
+        let start = MenuItem::new("Connect", true, None);
+        let stop = MenuItem::new("Disconnect", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::new();
         menu.append_items(&[&show, &PredefinedMenuItem::separator(), &start, &stop, &PredefinedMenuItem::separator(), &quit])?;
@@ -485,23 +591,6 @@ impl GuiApp {
                             self.message = "Got your PSN account ID from Sony".into();
                         }
                         Err(e) => self.account.error = e,
-                    }
-                }
-                Some(TaskResult::Registered(reg, host)) => {
-                    // keep the console parameters: write them straight into the saved config
-                    self.cfg.console.host = host;
-                    self.cfg.console.regist_key = http::hex(reg.creds.regist_key_trimmed());
-                    self.cfg.console.rp_key = http::hex(&reg.creds.morning);
-                    if !reg.nickname.is_empty() {
-                        self.cfg.console.nickname = reg.nickname.clone();
-                    }
-                    let name = if reg.nickname.is_empty() { "console".to_string() } else { reg.nickname.clone() };
-                    if self.save() {
-                        self.message = format!("Registered with {name} (MAC {}); saved", reg.mac);
-                    } else {
-                        self.dirty = true;
-                        let m = self.message.clone();
-                        self.message = format!("Registered with {name}, but {m}");
                     }
                 }
                 None => {}
@@ -649,104 +738,197 @@ impl GuiApp {
         }
     }
 
-    fn ui_run(&mut self, ui: &mut egui::Ui) {
-        let (running, status, streaming, stopping) = {
-            let mut sh = self.shared.lock().unwrap();
-            sh.reap();
-            (
-                sh.running(),
-                sh.runner.as_ref().map(|r| r.status()).unwrap_or_else(|| "Not running".into()),
-                sh.runner.as_ref().map(|r| r.is_streaming()).unwrap_or(false),
-                !sh.stopping.is_empty(),
-            )
-        };
-        ui.horizontal(|ui| {
-            let (dot, text) = if streaming {
-                (egui::Color32::from_rgb(0x22, 0xc5, 0x5e), "Streaming")
-            } else if running {
-                (egui::Color32::from_rgb(0xea, 0xb3, 0x08), "Running")
-            } else {
-                (egui::Color32::GRAY, if stopping { "Stopping…" } else { "Stopped" })
-            };
-            ui.colored_label(dot, "⏺");
-            ui.heading(text);
-        });
-        ui.label(status);
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if !running {
-                if ui.add_enabled(!stopping, egui::Button::new("▶ Start")).clicked() {
-                    self.start();
+    fn console_label(&self) -> String {
+        let c = &self.cfg.console;
+        match (c.nickname.trim().is_empty(), c.host.trim().is_empty()) {
+            (false, _) => c.nickname.clone(),
+            (true, false) => c.host.clone(),
+            (true, true) => "your PS5".into(),
+        }
+    }
+
+    fn save_and_restart(&mut self) {
+        if !self.save() {
+            return;
+        }
+        self.shared.lock().unwrap().stop();
+        self.message = "Saved; reconnecting…".into();
+        let shared = self.shared.clone();
+        let cfg = self.cfg.clone();
+        thread::spawn(move || {
+            for _ in 0..100 {
+                thread::sleep(Duration::from_millis(100));
+                let mut sh = shared.lock().unwrap();
+                sh.reap();
+                if sh.stopping.is_empty() {
+                    if let Err(e) = sh.start(&cfg) {
+                        log::error!("restart: {e:#}");
+                    }
+                    break;
                 }
-            } else {
-                if ui.button("⏹ Stop").clicked() {
-                    self.shared.lock().unwrap().stop();
-                }
-                if self.dirty && ui.button("Save & restart").clicked() && self.save() {
-                    self.shared.lock().unwrap().stop();
-                    self.message = "Saved; restarting once the session has stopped".into();
-                    let shared = self.shared.clone();
-                    let cfg = self.cfg.clone();
-                    thread::spawn(move || {
-                        for _ in 0..100 {
-                            thread::sleep(Duration::from_millis(100));
-                            let mut sh = shared.lock().unwrap();
-                            sh.reap();
-                            if sh.stopping.is_empty() {
-                                if let Err(e) = sh.start(&cfg) {
-                                    log::error!("restart: {e:#}");
-                                }
-                                break;
-                            }
-                        }
-                    });
-                }
-            }
-        });
-        ui.add_space(4.0);
-        ui.label(format!(
-            "While running, the capture window grabs keyboard and mouse: {} toggles capture, {} ends the session.",
-            self.cfg.input.capture_toggle, self.cfg.input.quit
-        ));
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.strong("Log");
-            if ui.small_button("Clear").clicked() {
-                logbuf::clear();
-            }
-        });
-        egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-            for line in logbuf::lines() {
-                ui.label(egui::RichText::new(line).monospace().size(11.0));
             }
         });
     }
 
+    fn ui_run(&mut self, ui: &mut egui::Ui) {
+        if self.cfg.credentials().is_err() || self.cfg.console.host.trim().is_empty() {
+            ui.add_space(24.0);
+            ui.heading("No PS5 linked yet");
+            ui.label("Link this PC with your PS5 once. After that, one click connects.");
+            ui.add_space(8.0);
+            if ui.add(egui::Button::new(egui::RichText::new("Set up my PS5…").size(16.0)).min_size(egui::vec2(180.0, 36.0))).clicked() {
+                self.open_wizard();
+            }
+            return;
+        }
+
+        let snap = self.shared.lock().unwrap().snapshot();
+        let name = self.console_label();
+        let phase = snap.state.as_ref().map(|s| s.phase.clone()).unwrap_or(Phase::Stopped);
+        let problem = snap.state.as_ref().and_then(|s| s.problem.clone()).filter(|_| phase != Phase::Ready);
+
+        let (color, title) = if snap.running && phase == Phase::Ready {
+            (egui::Color32::from_rgb(GREEN.0, GREEN.1, GREEN.2), format!("Connected to {name}"))
+        } else if snap.running {
+            (egui::Color32::from_rgb(AMBER.0, AMBER.1, AMBER.2), phase.label())
+        } else if snap.stopping {
+            (egui::Color32::GRAY, "Disconnecting…".to_string())
+        } else if problem.is_some() {
+            (egui::Color32::from_rgb(RED.0, RED.1, RED.2), "Not connected".to_string())
+        } else {
+            (egui::Color32::GRAY, "Not connected".to_string())
+        };
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("⏺").size(26.0).color(color));
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new(&title).size(22.0).strong());
+                ui.weak(format!("{name}  ·  {}", self.cfg.console.host));
+            });
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let big = |t: &str| egui::Button::new(egui::RichText::new(t).size(17.0)).min_size(egui::vec2(170.0, 38.0));
+            if snap.running {
+                if ui.add(big("⏹  Disconnect")).clicked() {
+                    self.shared.lock().unwrap().stop();
+                }
+                if self.dirty && ui.button("Save changes & reconnect").clicked() {
+                    self.save_and_restart();
+                }
+            } else if ui.add_enabled(!snap.stopping, big("▶  Connect")).clicked() {
+                self.start();
+            }
+        });
+
+        if let Some(p) = &problem {
+            ui.add_space(10.0);
+            let stopped = !snap.running;
+            let tint = if stopped { RED } else { AMBER };
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgb(tint.0, tint.1, tint.2).gamma_multiply(0.12))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(tint.0, tint.1, tint.2)))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(egui::RichText::new(&p.title).strong().size(16.0));
+                    ui.label(&p.fix);
+                    match p.kind {
+                        ProblemKind::PasscodeNeeded | ProblemKind::PasscodeWrong => {
+                            ui.horizontal(|ui| {
+                                ui.label("Login passcode:");
+                                ui.add(egui::TextEdit::singleline(&mut self.run_passcode).password(true).char_limit(8).desired_width(80.0));
+                                self.run_passcode.retain(|c| c.is_ascii_digit());
+                                if ui.add_enabled(!self.run_passcode.is_empty(), egui::Button::new("Save & connect")).clicked() {
+                                    self.login_pin_buf = std::mem::take(&mut self.run_passcode);
+                                    self.dirty = true;
+                                    self.start();
+                                }
+                            });
+                        }
+                        ProblemKind::NotPaired => {
+                            if ui.button("Set up again…").clicked() {
+                                self.open_wizard();
+                            }
+                        }
+                        _ => {}
+                    }
+                    ui.collapsing("Technical details", |ui| {
+                        ui.monospace(&p.detail);
+                    });
+                });
+        }
+
+        ui.add_space(10.0);
+        if snap.running && phase == Phase::Ready {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new("🎮  Your keyboard and mouse control the PS5").strong().size(15.0));
+                ui.label(format!(
+                    "…while the small capture window is in front. {} gives you your mouse back, {} disconnects.",
+                    self.cfg.input.capture_toggle, self.cfg.input.quit
+                ));
+                ui.add_space(6.0);
+                if let Some(cs) = &snap.controller {
+                    ui.horizontal_top(|ui| {
+                        let left = (ui.available_width() * 0.52).clamp(260.0, 420.0);
+                        ui.allocate_ui(egui::vec2(left, 0.0), |ui| {
+                            ui.vertical(|ui| {
+                                preview::controller(ui, cs);
+                                ui.weak("Live: what the PS5 receives. Press keys or move the mouse while capturing to see it.");
+                            });
+                        });
+                        ui.separator();
+                        if let Some((name, cfg)) = &snap.profile {
+                            ui.vertical(|ui| preview::bindings_panel(ui, cfg, name, cs));
+                        }
+                    });
+                }
+            });
+        } else if !snap.running && problem.is_none() {
+            ui.label("Press Connect to play. A small window opens and takes over your keyboard and mouse:");
+            ui.label(format!("   •  {}  gives you your mouse back, and press it again to continue playing", self.cfg.input.capture_toggle));
+            ui.label(format!("   •  {}  disconnects", self.cfg.input.quit));
+            ui.label("   •  The Bindings tab shows which key does what.");
+        }
+
+        ui.add_space(10.0);
+        egui::CollapsingHeader::new("Technical log").default_open(false).show(ui, |ui| {
+            if ui.small_button("Clear").clicked() {
+                logbuf::clear();
+            }
+            egui::ScrollArea::vertical().stick_to_bottom(true).max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
+                for line in logbuf::lines() {
+                    ui.label(egui::RichText::new(line).monospace().size(11.0));
+                }
+            });
+        });
+    }
+
     fn ui_console(&mut self, ui: &mut egui::Ui) {
-        let c = &mut self.cfg.console;
+        let linked = self.cfg.credentials().is_ok();
+        ui.add_space(4.0);
+        if linked {
+            ui.label(egui::RichText::new(format!("🎮  {}", self.console_label())).size(20.0).strong());
+            ui.weak(format!("Linked · address {}", self.cfg.console.host));
+        } else {
+            ui.label(egui::RichText::new("No PS5 linked yet").size(20.0).strong());
+        }
+        ui.add_space(6.0);
+        if ui.button(if linked { "Link a different PS5…" } else { "Set up my PS5…" }).clicked() {
+            self.open_wizard();
+        }
+        ui.add_space(10.0);
+
         let mut changed = false;
-        egui::Grid::new("console").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            ui.label("Console address");
-            changed |= ui.text_edit_singleline(&mut c.host).changed();
-            ui.end_row();
-            ui.label("Name");
-            changed |= ui.text_edit_singleline(&mut c.nickname).changed();
-            ui.end_row();
-            ui.label("Regist key");
-            changed |= ui.add(egui::TextEdit::singleline(&mut c.regist_key).font(egui::TextStyle::Monospace)).changed();
-            ui.end_row();
-            ui.label("RP key");
-            changed |= ui
-                .add(egui::TextEdit::singleline(&mut c.rp_key).font(egui::TextStyle::Monospace).desired_width(280.0))
-                .changed();
-            ui.end_row();
+        egui::Grid::new("console_basic").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
             ui.label("Login passcode");
             changed |= ui
-                .add(egui::TextEdit::singleline(&mut self.login_pin_buf).password(true).hint_text("only if the console asks"))
+                .add(egui::TextEdit::singleline(&mut self.login_pin_buf).password(true).hint_text("only if your PS5 asks for one"))
                 .changed();
             ui.end_row();
             ui.label("");
-            changed |= ui.checkbox(&mut c.wake, "Wake the console from rest mode when starting").changed();
+            changed |= ui.checkbox(&mut self.cfg.console.wake, "Wake the PS5 from rest mode when connecting").changed();
             ui.end_row();
         });
         self.dirty |= changed;
@@ -794,53 +976,30 @@ impl GuiApp {
             }
         });
 
-        ui.add_space(10.0);
-        ui.group(|ui| {
-            ui.strong("Register (pair) a console");
-            ui.label("On the PS5: Settings › System › Remote Play › Link Device, then enter the code shown.");
-            egui::Grid::new("register").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new("Advanced: address and pairing keys").default_open(false).show(ui, |ui| {
+            ui.weak("Filled in by the setup. Change them only if you know what you're doing.");
+            let c = &mut self.cfg.console;
+            let mut changed = false;
+            egui::Grid::new("console_adv").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 ui.label("Console address");
-                ui.text_edit_singleline(&mut self.reg_host);
+                changed |= ui.text_edit_singleline(&mut c.host).changed();
                 ui.end_row();
-                ui.label("Code (8 digits)");
-                ui.text_edit_singleline(&mut self.reg_pin);
+                ui.label("Name");
+                changed |= ui.text_edit_singleline(&mut c.nickname).changed();
                 ui.end_row();
-                ui.label("PSN account ID");
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.reg_account).hint_text("base64 or decimal"));
-                    if ui.button("Get my account ID…").clicked() {
-                        self.account = AccountFlow {
-                            active: true,
-                            clipboard_baseline: psn::clipboard::text(),
-                            ..Default::default()
-                        };
-                        if let Err(e) = psn::open_login_page() {
-                            self.account.error = format!("{e:#}");
-                        }
-                    }
-                });
+                ui.label("Regist key");
+                changed |= ui.add(egui::TextEdit::singleline(&mut c.regist_key).font(egui::TextStyle::Monospace)).changed();
+                ui.end_row();
+                ui.label("RP key");
+                changed |= ui
+                    .add(egui::TextEdit::singleline(&mut c.rp_key).font(egui::TextStyle::Monospace).desired_width(280.0))
+                    .changed();
                 ui.end_row();
             });
-            if self.account.active {
-                ui.group(|ui| self.ui_account_flow(ui));
-            }
-            if ui.button("Register").clicked() {
-                let (host, pin, account) = (self.reg_host.trim().to_string(), self.reg_pin.trim().to_string(), self.reg_account.clone());
-                self.message = "Registering…".into();
-                self.spawn_task(move || {
-                    let r = (|| -> Result<regist::Registered> {
-                        let ip = resolve_host(&host)?;
-                        let pin: u32 = pin.parse().map_err(|_| anyhow!("the code must be the 8 digits shown on the console"))?;
-                        let account = crate::parse_account_id(&account)?;
-                        regist::register(ip, pin, account)
-                    })();
-                    match r {
-                        Ok(reg) => TaskResult::Registered(Box::new(reg), host),
-                        Err(e) => TaskResult::Message(format!("Registration failed: {e:#}")),
-                    }
-                });
-            }
+            self.dirty |= changed;
         });
+
     }
 
     fn ui_account_flow(&mut self, ui: &mut egui::Ui) {
@@ -1204,10 +1363,12 @@ impl eframe::App for GuiApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Run, "▶ Run");
-                ui.selectable_value(&mut self.tab, Tab::Console, "🖥 Console");
-                ui.selectable_value(&mut self.tab, Tab::Settings, "⚙ Settings");
-                ui.selectable_value(&mut self.tab, Tab::Bindings, "🎮 Bindings");
+                ui.add_enabled_ui(self.wizard.is_none(), |ui| {
+                    ui.selectable_value(&mut self.tab, Tab::Run, "▶ Play");
+                    ui.selectable_value(&mut self.tab, Tab::Console, "🖥 Console");
+                    ui.selectable_value(&mut self.tab, Tab::Settings, "⚙ Settings");
+                    ui.selectable_value(&mut self.tab, Tab::Bindings, "🎮 Bindings");
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Quit").on_hover_text("Stop the session and exit").clicked() {
                         self.quitting = true;
@@ -1247,8 +1408,17 @@ impl eframe::App for GuiApp {
                 }
             });
         });
+        if self.wizard.is_some() {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.ui_wizard(ui));
+            });
+            ctx.request_repaint_after(Duration::from_millis(250));
+            return;
+        }
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Run => self.ui_run(ui),
+            Tab::Run => {
+                egui::ScrollArea::vertical().show(ui, |ui| self.ui_run(ui));
+            }
             Tab::Console => {
                 egui::ScrollArea::vertical().show(ui, |ui| self.ui_console(ui));
             }
@@ -1258,17 +1428,24 @@ impl eframe::App for GuiApp {
             Tab::Bindings => self.ui_bindings(ui),
         });
 
-        let busy = !self.tasks.is_empty() || self.listen.is_some() || self.account.active || {
+        let (session_active, streaming) = {
             let sh = self.shared.lock().unwrap();
-            sh.runner.is_some() || !sh.stopping.is_empty()
+            (sh.runner.is_some() || !sh.stopping.is_empty(), sh.runner.as_ref().map(|r| r.is_streaming()).unwrap_or(false))
         };
-        if busy {
+        if streaming && self.tab == Tab::Run {
+            ctx.request_repaint_after(Duration::from_millis(33)); // live controller preview
+        } else if !self.tasks.is_empty() || self.listen.is_some() || self.account.active || session_active {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.shared.lock().unwrap().stop_and_wait();
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(self.hwnd as _, TRAY_TIMER_ID);
+        }
+        // dropping the tray icon removes it from the taskbar
+        TRAY.with(|t| t.borrow_mut().take());
     }
 }
 
