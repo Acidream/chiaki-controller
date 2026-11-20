@@ -1,5 +1,6 @@
-//! A running session: the session thread (wake, connect, stream, reconnect) plus the input
-//! capture window on its own thread. Can be started and stopped any number of times.
+//! A running session: the session thread (wake, connect, stream, reconnect) plus input
+//! capture, either in its own small window or in the settings window. Can be started and
+//! stopped any number of times.
 
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::config::{Config, Credentials};
-use crate::input::windows::{UiOptions, WindowHandle};
+use crate::input::windows::{HostOptions, WindowHandle};
 use crate::{input, regist, session, stream};
 
 pub fn resolve_host(host: &str) -> Result<IpAddr> {
@@ -186,6 +187,15 @@ pub struct RunState {
     pub problem: Option<Problem>,
 }
 
+/// Where keyboard and mouse are captured.
+#[derive(Clone, Copy)]
+pub enum CaptureIn {
+    /// a small window of its own (command line)
+    OwnWindow,
+    /// the settings window (its handle), prepared with `input::windows::install_in_window`
+    Window(isize),
+}
+
 pub struct Runner {
     stop: Arc<AtomicBool>,
     window: Arc<Mutex<Option<WindowHandle>>>,
@@ -194,12 +204,15 @@ pub struct Runner {
     active_profile: Arc<Mutex<String>>,
     cfg: Arc<Config>,
     session: Option<JoinHandle<()>>,
-    ui: Option<JoinHandle<Result<()>>>,
+    /// applies input to the mapper; ends when capture ends
+    pump: Option<JoinHandle<()>>,
+    /// the own capture window's thread
+    own_window: Option<JoinHandle<Result<()>>>,
 }
 
 impl Runner {
-    /// Validates the config and starts the session and the capture window.
-    pub fn start(cfg: &Config) -> Result<Runner> {
+    /// Validates the config and starts the session and input capture.
+    pub fn start(cfg: &Config, capture_in: CaptureIn) -> Result<Runner> {
         let creds = cfg.credentials()?;
         if cfg.console.host.trim().is_empty() {
             bail!("no console address set");
@@ -221,6 +234,51 @@ impl Runner {
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(RunState { phase: Phase::Starting, problem: None }));
 
+        let (tx, rx) = std::sync::mpsc::channel();
+        let opts = HostOptions {
+            capture_key,
+            quit_key,
+            capture_on_start: cfg.input.capture_on_start,
+            stop: stop.clone(),
+            status: status.clone(),
+            active_profile: active_profile.clone(),
+        };
+        let own_window = match capture_in {
+            CaptureIn::Window(hwnd) => {
+                *window.lock().unwrap() = Some(input::windows::attach_to_window(hwnd, tx, opts)?);
+                None
+            }
+            CaptureIn::OwnWindow => {
+                let window = window.clone();
+                let status = status.clone();
+                let stop = stop.clone();
+                Some(thread::Builder::new().name("capture".into()).spawn(move || {
+                    let r = input::windows::run_window(tx, opts, |h| *window.lock().unwrap() = Some(h));
+                    *window.lock().unwrap() = None;
+                    if let Err(e) = &r {
+                        log::error!("capture window: {e:#}");
+                        *status.lock().unwrap() = format!("Capture window failed: {e:#}");
+                    }
+                    // closing the capture window ends the session
+                    stop.store(true, Ordering::Relaxed);
+                    r
+                })?)
+            }
+        };
+
+        let pump = {
+            let link = link.clone();
+            let active_profile = active_profile.clone();
+            let window = window.clone();
+            thread::Builder::new().name("input".into()).spawn(move || {
+                input::windows::pump(mapper, link, rx, active_profile, tick, || {
+                    if let Some(w) = *window.lock().unwrap() {
+                        w.refresh();
+                    }
+                })
+            })?
+        };
+
         let session = {
             let ctx = SessionCtx {
                 link: link.clone(),
@@ -233,34 +291,17 @@ impl Runner {
             thread::Builder::new().name("session".into()).spawn(move || session_loop(cfg, creds, ip, profile, ctx))?
         };
 
-        let ui = {
-            let link = link.clone();
-            let status = status.clone();
-            let status_ui = status.clone();
-            let window = window.clone();
-            let stop = stop.clone();
-            let capture_on_start = cfg.input.capture_on_start;
-            let active_profile = active_profile.clone();
-            thread::Builder::new().name("capture".into()).spawn(move || {
-                let r = input::windows::run(
-                    mapper,
-                    link,
-                    status_ui,
-                    UiOptions { active_profile, capture_key, quit_key, capture_on_start, tick },
-                    |h| *window.lock().unwrap() = Some(h),
-                );
-                *window.lock().unwrap() = None;
-                if let Err(e) = &r {
-                    log::error!("capture window: {e:#}");
-                    *status.lock().unwrap() = format!("Capture window failed: {e:#}");
-                }
-                // closing the capture window ends the session
-                stop.store(true, Ordering::Relaxed);
-                r
-            })?
-        };
-
-        Ok(Runner { stop, window, link, state, active_profile, cfg: Arc::new(cfg.clone()), session: Some(session), ui: Some(ui) })
+        Ok(Runner {
+            stop,
+            window,
+            link,
+            state,
+            active_profile,
+            cfg: Arc::new(cfg.clone()),
+            session: Some(session),
+            pump: Some(pump),
+            own_window,
+        })
     }
 
     pub fn is_streaming(&self) -> bool {
@@ -271,7 +312,19 @@ impl Runner {
         self.state.lock().unwrap().clone()
     }
 
-    /// Name of the profile the capture window is using right now.
+    /// Whether keyboard and mouse go to the PS5 right now.
+    pub fn is_capturing(&self) -> bool {
+        input::windows::is_capturing()
+    }
+
+    /// Takes over keyboard and mouse (if the window is in front) or gives them back.
+    pub fn set_capture(&self, on: bool) {
+        if let Some(w) = *self.window.lock().unwrap() {
+            w.set_capture(on);
+        }
+    }
+
+    /// Name of the profile in use right now.
     pub fn active_profile(&self) -> String {
         self.active_profile.lock().map(|p| p.clone()).unwrap_or_default()
     }
@@ -285,9 +338,17 @@ impl Runner {
         self.link.state()
     }
 
-    /// True once the capture window is closed and the session thread has ended.
+    /// True once capture and the session thread have ended.
     pub fn is_finished(&self) -> bool {
-        self.session.as_ref().map(|t| t.is_finished()).unwrap_or(true) && self.ui.as_ref().map(|t| t.is_finished()).unwrap_or(true)
+        fn done<T>(t: &Option<JoinHandle<T>>) -> bool {
+            t.as_ref().map(|t| t.is_finished()).unwrap_or(true)
+        }
+        done(&self.session) && done(&self.pump) && done(&self.own_window)
+    }
+
+    /// Whether the session was told to stop (as opposed to giving up by itself).
+    pub fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 
     /// Asks everything to stop without waiting.
@@ -301,8 +362,8 @@ impl Runner {
     /// Stops and waits (up to the socket timeouts, a few seconds).
     pub fn stop_and_wait(mut self) -> Result<()> {
         self.request_stop();
-        let ui = self.ui.take().map(|t| t.join());
-        if let Some(t) = self.session.take() {
+        let ui = self.own_window.take().map(|t| t.join());
+        for t in [self.pump.take(), self.session.take()].into_iter().flatten() {
             let _ = t.join();
         }
         match ui {
@@ -314,7 +375,7 @@ impl Runner {
 
     /// Runs until the capture window is closed (used by the command line `run`).
     pub fn wait(mut self) -> Result<()> {
-        let r = self.ui.take().map(|t| t.join());
+        let r = self.own_window.take().map(|t| t.join());
         self.stop_and_wait()?;
         match r {
             Some(Ok(r)) => r,
@@ -340,7 +401,7 @@ struct SessionCtx {
 
 fn session_loop(cfg: Config, creds: Credentials, ip: IpAddr, profile: stream::VideoProfile, ctx: SessionCtx) {
     let SessionCtx { link, status, window, stop, state } = ctx;
-    // status text for the capture window
+    // status text for the own capture window
     let st = |t: &str| {
         log::info!("{t}");
         *status.lock().unwrap() = t.to_string();

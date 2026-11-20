@@ -16,7 +16,7 @@ use eframe::egui;
 use crate::config::{Binding, BindingDetail, Config, MouseTarget, Profile};
 use crate::input::{keys, mapper::Mapper};
 use crate::controller::ControllerState;
-use crate::runner::{resolve_host, Phase, ProblemKind, RunState, Runner};
+use crate::runner::{resolve_host, CaptureIn, Phase, ProblemKind, RunState, Runner};
 
 mod preview;
 mod wizard;
@@ -31,6 +31,8 @@ struct Shared {
     cfg_path: PathBuf,
     /// state of the last session that ended on its own (its problem stays visible)
     last_state: Option<RunState>,
+    /// the settings window, which also captures keyboard and mouse while playing
+    hwnd: isize,
 }
 
 /// What the window and tray show about the session.
@@ -41,13 +43,16 @@ struct Snapshot {
     controller: Option<ControllerState>,
     /// active profile and the config of the running session
     profile: Option<(String, Arc<Config>)>,
+    /// keyboard and mouse go to the PS5
+    capturing: bool,
 }
 
 impl Shared {
     fn reap(&mut self) {
         if self.runner.as_ref().map(|r| r.is_finished()).unwrap_or(false) {
             if let Some(r) = self.runner.take() {
-                self.last_state = Some(r.run_state());
+                // a session the user ended (quit key) leaves nothing to explain
+                self.last_state = (!r.stop_requested()).then(|| r.run_state());
                 self.stopping.push(thread::spawn(move || {
                     let _ = r.stop_and_wait();
                 }));
@@ -70,7 +75,7 @@ impl Shared {
         }
         logbuf::clear();
         self.last_state = None;
-        self.runner = Some(Runner::start(cfg)?);
+        self.runner = Some(Runner::start(cfg, CaptureIn::Window(self.hwnd))?);
         Ok(())
     }
 
@@ -81,12 +86,15 @@ impl Shared {
 
     /// Like `snapshot` without side effects (for the tray timer).
     fn peek(&self) -> Snapshot {
+        // told to stop (quit key) but still finishing a network call
+        let winding_down = self.runner.as_ref().map(|r| r.stop_requested() && !r.is_finished()).unwrap_or(false);
         Snapshot {
-            running: self.running(),
-            stopping: !self.stopping.is_empty(),
+            running: self.running() && !winding_down,
+            stopping: !self.stopping.is_empty() || winding_down,
             state: self.runner.as_ref().map(|r| r.run_state()).or_else(|| self.last_state.clone()),
             controller: self.runner.as_ref().filter(|r| r.is_streaming()).map(|r| r.controller_state()),
             profile: self.runner.as_ref().map(|r| (r.active_profile(), r.config())),
+            capturing: self.runner.as_ref().map(|r| r.is_capturing()).unwrap_or(false),
         }
     }
 
@@ -406,7 +414,14 @@ impl GuiApp {
             c
         };
 
-        let shared = Arc::new(Mutex::new(Shared { runner: None, stopping: Vec::new(), cfg_path: cfg_path.clone(), last_state: None }));
+        crate::input::windows::install_in_window(hwnd)?;
+        let shared = Arc::new(Mutex::new(Shared {
+            runner: None,
+            stopping: Vec::new(),
+            cfg_path: cfg_path.clone(),
+            last_state: None,
+            hwnd,
+        }));
         let quit_requested = Arc::new(AtomicBool::new(false));
         match Self::create_tray(&cc.egui_ctx, hwnd, shared.clone(), quit_requested.clone()) {
             Ok(tray) => {
@@ -480,6 +495,8 @@ impl GuiApp {
             if e.id == show_id {
                 show_window(hwnd);
             } else if e.id == start_id {
+                // the window captures keyboard and mouse, so it has to be in front
+                show_window(hwnd);
                 let mut sh = shared.lock().unwrap();
                 let result = Config::load(&sh.cfg_path).and_then(|cfg| sh.start(&cfg));
                 if let Err(e) = result {
@@ -770,6 +787,46 @@ impl GuiApp {
         });
     }
 
+    /// Says whether keyboard and mouse go to the PS5, and how to switch.
+    fn capture_banner(&mut self, ui: &mut egui::Ui, snap: &Snapshot, ready: bool) {
+        let (capture, quit) = (&self.cfg.input.capture_toggle, &self.cfg.input.quit);
+        let (tint, headline, sub) = match (snap.capturing, ready) {
+            (true, true) => (GREEN, "🎮  Keyboard and mouse control your PS5".to_string(), format!("{capture} gives you your mouse back  ·  {quit} disconnects")),
+            (true, false) => (
+                AMBER,
+                "Waiting for the PS5…".to_string(),
+                format!("Keyboard and mouse are captured and go to the PS5 once connected  ·  {capture} releases"),
+            ),
+            (false, _) => (
+                (0x47, 0x4b, 0x55),
+                "Mouse released: the PS5 gets no input".to_string(),
+                format!("Press {capture} or the button to control the PS5 again  ·  {quit} disconnects"),
+            ),
+        };
+        let color = egui::Color32::from_rgb(tint.0, tint.1, tint.2);
+        egui::Frame::none().fill(color).rounding(6.0).inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(headline).size(18.0).strong().color(egui::Color32::WHITE));
+                    ui.label(egui::RichText::new(sub).color(egui::Color32::WHITE));
+                });
+                if !snap.capturing {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let b = egui::Button::new(egui::RichText::new(format!("🎮  Control the PS5 ({capture})")).size(15.0))
+                            .min_size(egui::vec2(0.0, 32.0));
+                        if ui.add(b).clicked() {
+                            if let Some(r) = &self.shared.lock().unwrap().runner {
+                                r.set_capture(true);
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ui.add_space(8.0);
+    }
+
     fn ui_run(&mut self, ui: &mut egui::Ui) {
         if self.cfg.credentials().is_err() || self.cfg.console.host.trim().is_empty() {
             ui.add_space(24.0);
@@ -785,7 +842,7 @@ impl GuiApp {
         let snap = self.shared.lock().unwrap().snapshot();
         let name = self.console_label();
         let phase = snap.state.as_ref().map(|s| s.phase.clone()).unwrap_or(Phase::Stopped);
-        let problem = snap.state.as_ref().and_then(|s| s.problem.clone()).filter(|_| phase != Phase::Ready);
+        let problem = snap.state.as_ref().and_then(|s| s.problem.clone()).filter(|_| phase != Phase::Ready && !snap.stopping);
 
         let (color, title) = if snap.running && phase == Phase::Ready {
             (egui::Color32::from_rgb(GREEN.0, GREEN.1, GREEN.2), format!("Connected to {name}"))
@@ -860,15 +917,12 @@ impl GuiApp {
         }
 
         ui.add_space(10.0);
+        if snap.running {
+            self.capture_banner(ui, &snap, phase == Phase::Ready);
+        }
         if snap.running && phase == Phase::Ready {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new("🎮  Your keyboard and mouse control the PS5").strong().size(15.0));
-                ui.label(format!(
-                    "…while the small capture window is in front. {} gives you your mouse back, {} disconnects.",
-                    self.cfg.input.capture_toggle, self.cfg.input.quit
-                ));
-                ui.add_space(6.0);
                 if let Some(cs) = &snap.controller {
                     ui.horizontal_top(|ui| {
                         let left = (ui.available_width() * 0.52).clamp(260.0, 420.0);
@@ -886,7 +940,7 @@ impl GuiApp {
                 }
             });
         } else if !snap.running && problem.is_none() {
-            ui.label("Press Connect to play. A small window opens and takes over your keyboard and mouse:");
+            ui.label("Press Connect to play. This window then takes over your keyboard and mouse:");
             ui.label(format!("   •  {}  gives you your mouse back, and press it again to continue playing", self.cfg.input.capture_toggle));
             ui.label(format!("   •  {}  disconnects", self.cfg.input.quit));
             ui.label("   •  The Bindings tab shows which key does what.");
@@ -1356,6 +1410,10 @@ impl eframe::App for GuiApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             hide_window(self.hwnd);
         }
+        if crate::input::windows::is_capturing() {
+            // keyboard and mouse belong to the PS5: show what they do
+            self.tab = Tab::Run;
+        }
         self.poll_tasks();
         self.poll_account_clipboard();
         self.handle_listen(ctx);
@@ -1365,7 +1423,7 @@ impl eframe::App for GuiApp {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(self.wizard.is_none(), |ui| {
                     ui.selectable_value(&mut self.tab, Tab::Run, "▶ Play");
-                    ui.selectable_value(&mut self.tab, Tab::Console, "🖥 Console");
+                    ui.selectable_value(&mut self.tab, Tab::Console, "🖥 Connection options");
                     ui.selectable_value(&mut self.tab, Tab::Settings, "⚙ Settings");
                     ui.selectable_value(&mut self.tab, Tab::Bindings, "🎮 Bindings");
                 });
@@ -1434,6 +1492,8 @@ impl eframe::App for GuiApp {
         };
         if streaming && self.tab == Tab::Run {
             ctx.request_repaint_after(Duration::from_millis(33)); // live controller preview
+        } else if session_active && self.tab == Tab::Run {
+            ctx.request_repaint_after(Duration::from_millis(100)); // capture state
         } else if !self.tasks.is_empty() || self.listen.is_some() || self.account.active || session_active {
             ctx.request_repaint_after(Duration::from_millis(250));
         }

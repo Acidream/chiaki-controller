@@ -52,9 +52,10 @@ and Windows.
   connecting, signing in, connected). Problems are explained with what to do, for example
   "Can't reach the PS5", "Remote Play is already in use", "Your PS5 asks for your login passcode"
   (with a field to enter it right there) or "The PS5 doesn't recognise this PC" (with a button to
-  link again). The technical details and the log are folded away underneath. While connected, a
-  live controller drawing shows exactly what the PS5 receives.
-- **Console**: the linked PS5, login passcode, wake from rest mode, check status / wake up / rest
+  link again). The technical details and the log are folded away underneath. While connected,
+  this tab is where you play (see below), with a live controller drawing of exactly what the PS5
+  receives and the active profile's keys next to it.
+- **Connection options**: the linked PS5, login passcode, wake from rest mode, check status / wake up / rest
   mode, and "Link a different PS5…". Address and pairing keys are under *Advanced*.
 - **Settings**: requested video size (never decoded), DualSense vs DualShock 4, reconnect, the
   release-mouse and disconnect keys, and program options (start in the tray, connect on launch).
@@ -69,10 +70,12 @@ Closing the window hides it to the tray. The tray icon shows the state by colour
 connected, amber: connecting, green: connected, red: needs attention) and in its tooltip; its menu
 has Open, Connect, Disconnect and Quit.
 
-While connected, a small capture window takes over keyboard and mouse. Its banner says what's
-going on: green "Keyboard and mouse control your PS5", amber "Waiting for the PS5…", or grey
-"Mouse released". **F8** releases / recaptures (or click it), **F12** disconnects. Capture is
-released automatically when it loses focus.
+While connected, the window itself takes over keyboard and mouse (the cursor is hidden and kept
+inside it) and switches to the Play tab. A banner says what's going on: green "Keyboard and mouse
+control your PS5", amber "Waiting for the PS5…", or grey "Mouse released" with a
+**Control the PS5** button. **F8** releases / recaptures, **F12** disconnects. Keyboard and mouse
+are released automatically when the window goes to the background or is hidden to the tray;
+**Connect** in the tray menu brings the window to the front.
 
 The config lives in `chiaki-controller.toml` in the current directory or next to the program if
 one exists there, otherwise in `%APPDATA%\chiaki-controller\`.
@@ -84,7 +87,7 @@ The window is the default; the command line still works without it:
 ```
 chiaki-controller init
 chiaki-controller register --host 192.168.1.50 --pin 12345678 --account-id <id>
-chiaki-controller run        # session + capture window, no settings window
+chiaki-controller run        # session + a small capture window, no settings window
 chiaki-controller wake | sleep | status | keys
 ```
 

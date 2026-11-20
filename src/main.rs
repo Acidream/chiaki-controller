@@ -280,7 +280,7 @@ Your PSN account ID: {}   (as a number: {})", id.base64, id.number);
                     println!("rest mode requested");
                     Ok(())
                 }
-                _ => runner::Runner::start(&cfg)?.wait(),
+                _ => runner::Runner::start(&cfg, runner::CaptureIn::OwnWindow)?.wait(),
             }
         }
     }
