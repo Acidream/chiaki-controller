@@ -25,32 +25,33 @@ pub fn resolve_host(host: &str) -> Result<IpAddr> {
         .with_context(|| format!("no IPv4 address for {host}"))
 }
 
-/// Wakes the console if needed and waits until it accepts sessions.
-fn ensure_awake(ip: IpAddr, creds: &Credentials, wake: bool, stop: &AtomicBool, status: &dyn Fn(&str)) -> Result<()> {
-    let state = regist::probe(ip).unwrap_or_default();
-    if state.starts_with("200") {
-        return Ok(());
-    }
-    if !wake {
-        if state.is_empty() {
-            log::warn!("console did not answer discovery; trying to connect anyway");
-        }
-        return Ok(());
-    }
-    status("Waking up the console ...");
+/// Sends a wakeup and waits until the console answers discovery as running.
+fn wake_and_wait(ip: IpAddr, creds: &Credentials, stop: &AtomicBool, status: &dyn Fn(&str)) -> Result<()> {
+    status("Console not reachable, waking it up ...");
     regist::wakeup(ip, creds)?;
     let deadline = Instant::now() + Duration::from_secs(45);
+    let mut last_wakeup = Instant::now();
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_secs(1));
         if regist::probe(ip).map(|s| s.starts_with("200")).unwrap_or(false) {
             thread::sleep(Duration::from_secs(2)); // let Remote Play come up
             return Ok(());
         }
+        if last_wakeup.elapsed() > Duration::from_secs(10) {
+            let _ = regist::wakeup(ip, creds); // UDP: repeat in case it was lost
+            last_wakeup = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(500));
     }
     if stop.load(Ordering::Relaxed) {
         return Ok(());
     }
-    bail!("the console did not wake up")
+    bail!("the console did not wake up (is \"Enable Turning On PS5 from Network\" on?)")
+}
+
+/// True for errors that mean the console isn't listening (off / rest mode), as opposed to
+/// the console answering and refusing.
+fn is_unreachable(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some())
 }
 
 pub struct Runner {
@@ -199,12 +200,22 @@ fn session_loop(
     let mut backoff = Duration::from_secs(2);
     while !stop.load(Ordering::Relaxed) {
         let attempt = (|| -> Result<stream::StreamEnd> {
-            ensure_awake(ip, &creds, cfg.console.wake, &stop, &st)?;
-            if stop.load(Ordering::Relaxed) {
-                return Ok(stream::StreamEnd::Stopped);
-            }
             st(&format!("Connecting to {ip} ..."));
-            let nonce = session::request_session(ip, &creds)?;
+            // connect first; only wake when the console isn't listening, so a running
+            // console connects without waiting on (UDP) discovery
+            let nonce = match session::request_session(ip, &creds) {
+                Ok(n) => n,
+                Err(e) if cfg.console.wake && is_unreachable(&e) => {
+                    log::info!("{e:#}");
+                    wake_and_wait(ip, &creds, &stop, &st)?;
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok(stream::StreamEnd::Stopped);
+                    }
+                    st(&format!("Connecting to {ip} ..."));
+                    session::request_session(ip, &creds)?
+                }
+                Err(e) => return Err(e),
+            };
             let ctrl = session::Ctrl::connect(ip, &nonce, &creds, cfg.console.login_pin.as_deref(), params.dualsense)?;
             st("Starting stream ...");
             let connected_status = format!(
