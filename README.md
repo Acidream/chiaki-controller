@@ -5,15 +5,20 @@ mouse into a DualSense (or DualShock 4) on your PS5, and does nothing else: no v
 no audio, no rendering. Use it when you're watching the PS5 on a TV or capture card and just want
 to play it with keyboard and mouse.
 
+It is made to work over Wi-Fi. Your input is a few small packets, the console is asked for the
+smallest video stream (which is thrown away unread), and nothing waits on video or audio, so a PC
+on Wi-Fi doesn't get the lag and stutter of a full Remote Play stream. Tested with GTA VI.
+
 It is a port of the protocol parts of [chiaki-ng](https://github.com/streetpea/chiaki-ng)
 (registration, session/ctrl, Takion transport, stream crypto, feedback packets), reduced to PS5
 and Windows.
 
 ## Why it's low latency
 
-- Every input change is sent the moment the Raw Input event arrives, on the same thread, without
-  queues or a separate sender thread. Button changes go out as feedback-history packets, stick
-  changes as feedback-state packets.
+- Every input change is sent the moment the Raw Input event arrives: the window hands it straight
+  to the input thread, which applies the bindings and sends at once (events that arrive together
+  go out as one update). Button changes go out as feedback-history packets, stick changes as
+  feedback-state packets.
 - Lost button releases are covered by resending the newest history packet 20/50/100/200 ms later
   (same scheme as chiaki-ng), so nothing gets stuck.
 - Video and audio packets are dropped after reading one byte: no MAC check, no decryption, no
@@ -26,11 +31,11 @@ and Windows.
 1. On the PS5: Settings > System > Remote Play > enable Remote Play. For waking from rest mode,
    also enable Settings > System > Power Saving > Features Available in Rest Mode > Stay Connected
    to the Internet and Enable Turning On PS5 from Network.
-2. Your PSN account ID is looked up for you: in the app press **Get my account ID…** next to the
-   account ID field (or run `chiaki-controller account-id`). Sony's sign-in page opens in your own
+2. Your PSN account ID is looked up for you during setup (step 4): press **Sign in with
+   PlayStation…** (or run `chiaki-controller account-id`). Sony's sign-in page opens in your own
    browser; sign in there, and when the page shows "redirect", copy the address bar. The app picks
    the address up from the clipboard and asks Sony for the ID. If you already use chiaki-ng, its
-   base64 "PSN Account-ID" works too.
+   base64 "PSN Account-ID" can be pasted instead.
 
    How this stays safe: your password is only typed into Sony's site, never into this app (there
    is no embedded login window). Only an address on Sony's exact redirect page is accepted. The
@@ -55,8 +60,8 @@ and Windows.
   link again). The technical details and the log are folded away underneath. While connected,
   this tab is where you play (see below), with a live controller drawing of exactly what the PS5
   receives and the active profile's keys next to it.
-- **Connection options**: the linked PS5, login passcode, wake from rest mode, check status / wake up / rest
-  mode, and "Link a different PS5…". Address and pairing keys are under *Advanced*.
+- **Connection options**: the linked PS5, login passcode, wake from rest mode, check status /
+  wake up / rest mode, and "Link a different PS5…". Address and pairing keys are under *Advanced*.
 - **Settings**: requested video size (never decoded), DualSense vs DualShock 4, reconnect, the
   release-mouse and disconnect keys, and program options (start in the tray, connect on launch).
 - **Bindings**: profiles (new, duplicate, rename, delete), mouse settings with sliders, and the
