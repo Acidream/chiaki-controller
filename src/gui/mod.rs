@@ -260,7 +260,7 @@ const STICK_ACTIONS: &[&str] = &[
     "left_stick_scale",
     "right_stick_scale",
 ];
-const OTHER_ACTIONS: &[&str] = &["touch", "touch_left", "touch_right", "profile_next"];
+const OTHER_ACTIONS: &[&str] = &["touch", "touch_left", "touch_right", "mouse_hold", "profile_next"];
 
 fn value_default(action: &str) -> Option<f32> {
     match action {

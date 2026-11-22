@@ -31,6 +31,8 @@ enum Action {
     Stick(Stick, Dir, f32),
     StickScale(Stick, f32),
     Touch(u16, u16),
+    /// While active, the mouse places the stick and it stays there instead of recentering.
+    MouseHold,
     Profile(usize),
     ProfileNext,
 }
@@ -94,6 +96,7 @@ fn parse_action(name: &str, value: Option<f32>, x: Option<u16>, y: Option<u16>, 
         )),
         "touch_left" => Ok(Action::Touch(TOUCHPAD_WIDTH / 4, TOUCHPAD_HEIGHT / 2)),
         "touch_right" => Ok(Action::Touch(TOUCHPAD_WIDTH * 3 / 4, TOUCHPAD_HEIGHT / 2)),
+        "mouse_hold" => Ok(Action::MouseHold),
         "profile_next" => Ok(Action::ProfileNext),
         "profile" => Ok(Action::Profile(profile_index(profile.context("the profile action needs `profile = \"name\"`")?)?)),
         other => {
@@ -143,6 +146,8 @@ pub struct Mapper {
     mouse_samples: VecDeque<(Instant, i32, i32)>,
     touch_id_next: u8,
     touch: Option<(i8, u16, u16)>,
+    /// Stick position placed by the mouse while a `mouse_hold` input is active.
+    hold_pos: Option<(f32, f32)>,
 }
 
 pub enum Event {
@@ -172,6 +177,7 @@ impl Mapper {
             mouse_samples: VecDeque::new(),
             touch_id_next: 0,
             touch: None,
+            hold_pos: None,
         })
     }
 
@@ -193,6 +199,7 @@ impl Mapper {
         self.toggled.clear();
         self.wheel_until.clear();
         self.mouse_samples.clear();
+        self.hold_pos = None;
     }
 
     pub fn handle(&mut self, ev: Event, now: Instant) {
@@ -214,7 +221,11 @@ impl Mapper {
                 self.wheel_until.insert(id, now + self.wheel_press);
             }
             Event::MouseMove(dx, dy) => {
-                self.mouse_samples.push_back((now, dx, dy));
+                if self.mouse_hold_active() {
+                    self.move_hold(dx, dy);
+                } else {
+                    self.mouse_samples.push_back((now, dx, dy));
+                }
             }
         }
     }
@@ -231,6 +242,29 @@ impl Mapper {
             }
             _ => {}
         }
+    }
+
+    fn mouse_hold_active(&self) -> bool {
+        let binds = &self.profiles[self.active].binds;
+        let is_hold = |id: &InputId| binds.get(id).is_some_and(|b| b.action == Action::MouseHold);
+        self.held.keys().any(|id| is_hold(id) && !binds[id].toggle) || self.toggled.iter().any(is_hold)
+    }
+
+    /// Moves the held stick position by a mouse delta. At the default sensitivity about
+    /// 200 mouse counts go from center to the edge; the position stays on the unit circle.
+    fn move_hold(&mut self, dx: i32, dy: i32) {
+        let m = &self.profiles[self.active].mouse;
+        let y_sign = if m.invert_y { -1.0 } else { 1.0 };
+        let per_count = m.sensitivity / 50.0;
+        let (mut x, mut y) = self.hold_pos.unwrap_or((0.0, 0.0));
+        x += dx as f32 * per_count * m.sensitivity_x;
+        y += dy as f32 * per_count * m.sensitivity_y * y_sign;
+        let len = (x * x + y * y).sqrt();
+        if len > 1.0 {
+            x /= len;
+            y /= len;
+        }
+        self.hold_pos = Some((x, y));
     }
 
     fn mouse_velocity(&mut self, now: Instant, window_ms: f32) -> (f32, f32) {
@@ -288,7 +322,7 @@ impl Mapper {
                 }
                 Action::StickScale(s, v) => scale[s as usize] = scale[s as usize].min(v),
                 Action::Touch(x, y) => touch_pos = touch_pos.or(Some((x, y))),
-                Action::Profile(_) | Action::ProfileNext => {}
+                Action::MouseHold | Action::Profile(_) | Action::ProfileNext => {}
             }
         }
 
@@ -309,7 +343,18 @@ impl Mapper {
         }
 
         let m = profile.mouse.clone();
-        if m.target != MouseTarget::None {
+        let holding = self.mouse_hold_active();
+        if !holding {
+            self.hold_pos = None;
+        }
+        if holding && matches!(m.target, MouseTarget::LeftStick | MouseTarget::RightStick) {
+            self.mouse_samples.clear();
+            let (x, y) = self.hold_pos.unwrap_or((0.0, 0.0));
+            let cap = m.max.clamp(0.0, 1.0);
+            let i = if m.target == MouseTarget::LeftStick { 0 } else { 1 };
+            sticks[i].0 += x * cap;
+            sticks[i].1 += y * cap;
+        } else if m.target != MouseTarget::None {
             let (vx, vy) = self.mouse_velocity(now, m.smoothing_ms);
             let y_sign = if m.invert_y { -1.0 } else { 1.0 };
             let vx = vx * m.sensitivity_x;
@@ -424,5 +469,29 @@ mod tests {
         assert_eq!(s.right_y, 0);
         let later = t + Duration::from_millis(50);
         assert_eq!(m.state(later).right_x, 0);
+    }
+
+    #[test]
+    fn mouse_hold_keeps_the_stick_where_the_mouse_put_it() {
+        let c = cfg("LAlt = \"mouse_hold\"");
+        let mut m = Mapper::new(&c).unwrap();
+        let t = Instant::now();
+        let alt = keys::parse("LAlt").unwrap();
+        m.handle(Event::Down(alt), t);
+        m.handle(Event::MouseMove(100, 0), t);
+        let half = m.state(t).right_x;
+        assert!(half > 15000 && half < 18000, "{half}");
+        // stays put with no further movement
+        assert_eq!(m.state(t + Duration::from_secs(2)).right_x, half);
+        // goes no further than the edge, and around the circle
+        m.handle(Event::MouseMove(1000, 0), t);
+        assert_eq!(m.state(t).right_x, 32767);
+        m.handle(Event::MouseMove(-200, 200), t);
+        let s = m.state(t);
+        assert!(s.right_y > 30000 && s.right_x.abs() < 15000, "{} {}", s.right_x, s.right_y);
+        // letting go recenters
+        m.handle(Event::Up(alt), t);
+        let s = m.state(t);
+        assert_eq!((s.right_x, s.right_y), (0, 0));
     }
 }

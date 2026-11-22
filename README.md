@@ -50,6 +50,7 @@ Two profiles come ready to use; the Bindings tab shows and changes every key.
 | E, G | R1 | | |
 | LShift / V, middle click | L3 sprint / R3 melee | | |
 | LCtrl (hold) | walk slowly | | |
+| LAlt (hold) | mouse holds the right stick in place (hotwiring, lock picking) | | |
 | Arrows, Z / X, Mouse 4 / 5 | D-pad | | |
 | Esc / Backspace / Tab / Home | Options / Create / Touchpad / PS | | |
 | **F2** | switch to Menu | | |

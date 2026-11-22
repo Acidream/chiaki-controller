@@ -1,6 +1,6 @@
 [package]
 name = "chiaki-controller"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Input-only PS5 Remote Play client for Windows: keyboard and mouse as a DualSense, no video or audio"
 license = "AGPL-3.0-only"

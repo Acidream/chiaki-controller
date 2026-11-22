@@ -40,6 +40,8 @@ tick_hz = 500           # mouse-to-stick update rate
 #   sticks:   left_stick_up/down/left/right  right_stick_up/down/left/right
 #   other:    left_stick_scale / right_stick_scale (hold to slow the stick, e.g. walk)
 #             touch (finger on the touchpad at x, y), touch_left, touch_right
+#             mouse_hold (while held the mouse places the stick and it stays there, for
+#               minigames like hotwiring a car; letting go recenters it)
 #             profile:<name>, profile_next
 #
 # Long form:  Key = { action = "r2", value = 0.5, toggle = true, turbo_hz = 10 }
@@ -79,6 +81,7 @@ S = "left_stick_down"
 A = "left_stick_left"
 D = "left_stick_right"
 LCtrl = { action = "left_stick_scale", value = 0.45 }   # walk
+LAlt = "mouse_hold"    # hold: mouse sets the right stick and it stays (hotwiring)
 LShift = "l3"          # sprint
 Space = "cross"        # jump
 C = "circle"           # crouch
