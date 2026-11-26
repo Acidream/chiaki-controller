@@ -361,7 +361,23 @@ impl Ctrl {
 
     /// Puts the console into rest mode.
     pub fn goto_bed(&self) -> Result<()> {
-        self.writer.lock().unwrap().send(CTRL_GOTO_BED, &[])
+        self.rest_handle().goto_bed()
+    }
+
+    /// A handle other threads can use to put the console into rest mode over this channel.
+    pub fn rest_handle(&self) -> RestHandle {
+        RestHandle(self.writer.clone())
+    }
+}
+
+/// Sends rest mode over a running ctrl channel. The PS5 allows only one Remote Play
+/// session, so while one runs, rest mode has to go through it.
+#[derive(Clone)]
+pub struct RestHandle(Arc<Mutex<CtrlWriter>>);
+
+impl RestHandle {
+    pub fn goto_bed(&self) -> Result<()> {
+        self.0.lock().unwrap().send(CTRL_GOTO_BED, &[])
     }
 }
 

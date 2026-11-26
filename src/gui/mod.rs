@@ -1012,21 +1012,36 @@ impl GuiApp {
                     })
                 });
             }
-            if ui.add_enabled(ready.is_some(), egui::Button::new("Rest mode")).clicked() {
-                let (cfg, creds, ip) = ready.unwrap();
-                self.spawn_task(move || {
-                    let r = (|| -> Result<()> {
-                        let nonce = session::request_session(ip, &creds)?;
-                        let ctrl = session::Ctrl::connect(ip, &nonce, &creds, cfg.console.login_pin.as_deref(), false)?;
-                        ctrl.goto_bed()?;
+            let live = self.shared.lock().unwrap().runner.as_ref().and_then(|r| r.rest_handle());
+            if ui.add_enabled(ready.is_some() || live.is_some(), egui::Button::new("Rest mode")).clicked() {
+                if let Some(rest) = live {
+                    // the PS5 takes one Remote Play session at a time: send it through ours,
+                    // then end ours so reconnecting doesn't wake the console again
+                    let shared = self.shared.clone();
+                    self.spawn_task(move || {
+                        let r = rest.goto_bed();
                         thread::sleep(Duration::from_millis(500));
-                        Ok(())
-                    })();
-                    TaskResult::Message(match r {
-                        Ok(()) => "Rest mode requested".into(),
-                        Err(e) => format!("Rest mode: {e:#}"),
-                    })
-                });
+                        shared.lock().unwrap().stop();
+                        TaskResult::Message(match r {
+                            Ok(()) => "Rest mode requested; session ended".into(),
+                            Err(e) => format!("Rest mode: {e:#}"),
+                        })
+                    });
+                } else if let Some((cfg, creds, ip)) = ready {
+                    self.spawn_task(move || {
+                        let r = (|| -> Result<()> {
+                            let nonce = session::request_session(ip, &creds)?;
+                            let ctrl = session::Ctrl::connect(ip, &nonce, &creds, cfg.console.login_pin.as_deref(), false)?;
+                            ctrl.goto_bed()?;
+                            thread::sleep(Duration::from_millis(500));
+                            Ok(())
+                        })();
+                        TaskResult::Message(match r {
+                            Ok(()) => "Rest mode requested".into(),
+                            Err(e) => format!("Rest mode: {e:#}"),
+                        })
+                    });
+                }
             }
         });
 

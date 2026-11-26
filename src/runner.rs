@@ -203,6 +203,8 @@ pub struct Runner {
     state: Arc<Mutex<RunState>>,
     active_profile: Arc<Mutex<String>>,
     cfg: Arc<Config>,
+    /// the ctrl channel of the current connection, if any
+    rest: Arc<Mutex<Option<session::RestHandle>>>,
     session: Option<JoinHandle<()>>,
     /// applies input to the mapper; ends when capture ends
     pump: Option<JoinHandle<()>>,
@@ -279,6 +281,7 @@ impl Runner {
             })?
         };
 
+        let rest = Arc::new(Mutex::new(None));
         let session = {
             let ctx = SessionCtx {
                 link: link.clone(),
@@ -286,6 +289,7 @@ impl Runner {
                 window: window.clone(),
                 stop: stop.clone(),
                 state: state.clone(),
+                rest: rest.clone(),
             };
             let cfg = cfg.clone();
             thread::Builder::new().name("session".into()).spawn(move || session_loop(cfg, creds, ip, profile, ctx))?
@@ -298,6 +302,7 @@ impl Runner {
             state,
             active_profile,
             cfg: Arc::new(cfg.clone()),
+            rest,
             session: Some(session),
             pump: Some(pump),
             own_window,
@@ -336,6 +341,11 @@ impl Runner {
 
     pub fn controller_state(&self) -> crate::controller::ControllerState {
         self.link.state()
+    }
+
+    /// The connected session's channel for sending rest mode (None while not connected).
+    pub fn rest_handle(&self) -> Option<session::RestHandle> {
+        self.rest.lock().unwrap().clone()
     }
 
     /// True once capture and the session thread have ended.
@@ -397,10 +407,11 @@ struct SessionCtx {
     window: Arc<Mutex<Option<WindowHandle>>>,
     stop: Arc<AtomicBool>,
     state: Arc<Mutex<RunState>>,
+    rest: Arc<Mutex<Option<session::RestHandle>>>,
 }
 
 fn session_loop(cfg: Config, creds: Credentials, ip: IpAddr, profile: stream::VideoProfile, ctx: SessionCtx) {
-    let SessionCtx { link, status, window, stop, state } = ctx;
+    let SessionCtx { link, status, window, stop, state, rest } = ctx;
     // status text for the own capture window
     let st = |t: &str| {
         log::info!("{t}");
@@ -460,7 +471,9 @@ fn session_loop(cfg: Config, creds: Credentials, ip: IpAddr, profile: stream::Vi
                         thread::sleep(Duration::from_millis(50));
                     }
                 });
+                *rest.lock().unwrap() = Some(ctrl.rest_handle());
                 let r = stream::run(&params, &ctrl, &link, &stop);
+                *rest.lock().unwrap() = None;
                 done.store(true, Ordering::Relaxed);
                 r
             });
